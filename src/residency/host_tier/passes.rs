@@ -15,7 +15,24 @@
 //! copied out yet. So the reads run as many layers ahead of the matmuls as the pinned sets
 //! hold, and the SSD is busy from the start of the pass. The copy stream calls back before
 //! and after a batch's copies ([`PassHook`]): it waits for the batch's reads, and gives its
-//! set back for the batch that many sets later.
+//! places back.
+//!
+//! The batches take the places as a ring ([`ring_places`], #37 round 31): each the places
+//! right behind the bytes the batch before took, from the start again where a layer's last
+//! place is passed, and the reader waits only for the batches whose bytes it overwrites. A
+//! layer that reads more experts than a set holds then takes the places behind its first
+//! batch's, not a whole set of its own: with two sets, such a layer let the reader run only
+//! one layer ahead, and a 64 GB machine's SSD stood still for 0.7 s of a 4.5 s 8K pass.
+//! The same experts reach the same VRAM, so the same outputs.
+//!
+//! The ring never makes the reader wait for more batches than the two sets would (round 32):
+//! where layers of different expert sizes meet, a layer's places can end before the bytes
+//! behind the batch before, and its first batch, back at the start, overwrote the batch just
+//! read (on a 32 GB machine, 35 ms a pass the reader stood still where the two sets wait for
+//! nothing). So a batch takes the first of these starts that waits for no more batches than
+//! the sets would: right behind the batch before, the layer's first place, its last places,
+//! or where its set would begin, and one that leaves the next batch such a start. A pass the
+//! ring cannot plan that way takes the two sets. `LEGION_DEBUG_TIER_PASS_RING=0` keeps a set per batch, as before.
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -109,6 +126,189 @@ pub(crate) fn plan_pass(
     Ok((srcs, batches))
 }
 
+/// Where a layer's staging places lie, for [`ring_places`]: its place indices past the gap
+/// run from `first` up to `end` (both sets and the room between them, [`super::stage_layout`]),
+/// and index `q`'s bytes of kind `k` start at `stage[k] + q * bytes[k]` (host addresses, or
+/// any one origin for every layer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Geo {
+    pub first: usize,
+    pub end: usize,
+    pub stage: [usize; 3],
+    pub bytes: [usize; 3],
+}
+
+impl Geo {
+    /// The bytes of places `q..q + n`, per kind.
+    fn span(&self, q: usize, n: usize) -> [(usize, usize); 3] {
+        std::array::from_fn(|k| {
+            let at = self.stage[k] + q * self.bytes[k];
+            (at, at + n * self.bytes[k])
+        })
+    }
+
+    /// The first place index whose bytes start at or past `ends` in every kind.
+    fn after(&self, ends: &[usize; 3]) -> usize {
+        (0..3)
+            .map(|k| {
+                ends[k]
+                    .saturating_sub(self.stage[k])
+                    .div_ceil(self.bytes[k].max(1))
+            })
+            .max()
+            .unwrap_or(0)
+            .max(self.first)
+    }
+
+    /// Where a batch of `n` places may start, in [`ring_places`]'s order: right behind the
+    /// bytes that end at `ends` (the first place where that passes `end`), the first place, the
+    /// last `n`, and the second set's start (`places` a set).
+    fn starts(&self, n: usize, ends: &[usize; 3], places: usize) -> Vec<usize> {
+        let mut ring = self.after(ends);
+        if ring + n > self.end {
+            ring = self.first;
+        }
+        let last = self.end.saturating_sub(n);
+        let second = self.end.saturating_sub(places);
+        let mut out = Vec::with_capacity(4);
+        for q in [ring, self.first, last, second] {
+            if q >= self.first && q + n <= self.end && !out.contains(&q) {
+                out.push(q);
+            }
+        }
+        out
+    }
+}
+
+/// A batch's bytes per kind, in [`ring_places`].
+type Span = [(usize, usize); 3];
+
+/// The batches before one with bytes `s` that the reader must see given back: up to the last
+/// of `spans` (one per batch, `None` for one without places) that `s` overlaps in any kind.
+fn need_of(spans: &[Option<Span>], s: &Span) -> usize {
+    let overlaps = |o: &Span| (0..3).any(|k| o[k].0 < s[k].1 && s[k].0 < o[k].1);
+    spans
+        .iter()
+        .rposition(|o| o.as_ref().is_some_and(overlaps))
+        .map_or(0, |b| b + 1)
+}
+
+/// [`ring_places`]' plan so far.
+struct Ring<'a> {
+    geo: &'a [Geo],
+    /// Per batch, its layer and places (`None`: reads into RAM slots only).
+    want: Vec<Option<(usize, usize)>>,
+    places: usize,
+    sets: usize,
+    /// Per batch planned, its bytes.
+    spans: Vec<Option<Span>>,
+}
+
+impl Ring<'_> {
+    /// The start for batch `b` (one with places), the batches it waits for and its bytes,
+    /// after batches `..b` ([`Self::spans`]) whose last ends at `ends`: the first of
+    /// [`Geo::starts`] that waits for no more batches than the sets would (`b + 1 - sets`).
+    /// `look`: only a start after which the next batch with places finds one too.
+    ///
+    /// The first, not the one that waits for the fewest: on a 64 GB machine that one made the
+    /// reader wait 0.33 s a pass instead of 0.04, as it leaves the batches after it less room.
+    fn pick(&mut self, b: usize, ends: &[usize; 3], look: bool) -> Option<(usize, usize, Span)> {
+        let (l, n) = self.want[b]?;
+        let g = self.geo[l];
+        let most = (b + 1).saturating_sub(self.sets);
+        let next = (b + 1..self.want.len()).find(|&j| self.want[j].is_some());
+        for q in g.starts(n, ends, self.places) {
+            let s = g.span(q, n);
+            let need = need_of(&self.spans, &s);
+            if need > most {
+                continue;
+            }
+            if look && let Some(j) = next {
+                let planned = self.spans.len();
+                self.spans.push(Some(s));
+                self.spans.resize(j, None);
+                let room = self.pick(j, &s.map(|r| r.1), false).is_some();
+                self.spans.truncate(planned);
+                if !room {
+                    continue;
+                }
+            }
+            return Some((q, need, s));
+        }
+        None
+    }
+}
+
+/// [`plan_pass`]'s batches over the places as a ring: per batch, in order, the place indices
+/// (past the gap, of the batch's layer `geo[l]`) its experts read into ([`To::Place`] ones, in
+/// their order), and the batches the reader must have seen given back before it reads this
+/// one (`need[b]`: every batch before it whose bytes this one's overlap, in any kind).
+///
+/// A batch takes the first start of [`Geo::starts`] (right behind the batch before, where it
+/// fits) that waits for no more batches than `sets` sets of `places` would (`b + 1 - sets`),
+/// and where it can, one that leaves the next batch such a start. `None` where a batch finds
+/// none: the pass takes the sets.
+pub(crate) fn ring_places(
+    batches: &[Batch],
+    geo: &[Geo],
+    places: usize,
+    sets: usize,
+) -> Result<Option<(Vec<Vec<usize>>, Vec<usize>)>, String> {
+    let want = batches
+        .iter()
+        .map(|batch| {
+            let n = batch.iter().filter(|r| matches!(r.2, To::Place(_))).count();
+            let Some(&(l, _, _)) = batch.first().filter(|_| n > 0) else {
+                // Only reads into RAM slots: no places.
+                return Ok(None);
+            };
+            let g = geo.get(l).ok_or("a staged pass layer without its places")?;
+            if n > g.end.saturating_sub(g.first) {
+                return Err(
+                    "a staged pass batch has more experts than its layer has places".into(),
+                );
+            }
+            Ok(Some((l, n)))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut ring = Ring {
+        geo,
+        want,
+        places,
+        sets,
+        spans: Vec::with_capacity(batches.len()),
+    };
+    let mut ends = [0usize; 3];
+    let mut at = Vec::with_capacity(batches.len());
+    let mut need = Vec::with_capacity(batches.len());
+    for b in 0..batches.len() {
+        let Some((_, n)) = ring.want[b] else {
+            at.push(Vec::new());
+            need.push(0);
+            ring.spans.push(None);
+            continue;
+        };
+        let Some((q, w, s)) = ring
+            .pick(b, &ends, true)
+            .or_else(|| ring.pick(b, &ends, false))
+        else {
+            return Ok(None);
+        };
+        ends = s.map(|r| r.1);
+        ring.spans.push(Some(s));
+        at.push((q..q + n).collect());
+        need.push(w);
+    }
+    Ok(Some((at, need)))
+}
+
+/// Whether staged passes take their places as a ring ([`ring_places`]):
+/// `LEGION_DEBUG_TIER_PASS_RING=0` gives every batch a set of its own, as before (A/B runs).
+fn ring_mode() -> bool {
+    static RING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *RING.get_or_init(|| std::env::var("LEGION_DEBUG_TIER_PASS_RING").as_deref() != Ok("0"))
+}
+
 #[derive(Default)]
 struct Progress {
     /// Batches read, and batches whose places the copy stream gave back.
@@ -126,7 +326,11 @@ struct Progress {
 pub(super) struct Pass {
     progress: Mutex<Progress>,
     moved: Condvar,
-    sets: usize,
+    /// Per batch, the batches the copy stream must have given back before it is read: those
+    /// whose places it overwrites, and every one before them.
+    need: Vec<usize>,
+    /// The batches took the places as a ring ([`ring_places`]), not a set each.
+    ring: bool,
     batches: usize,
     layers: usize,
     ram_experts: usize,
@@ -162,7 +366,7 @@ impl Pass {
             let stopped = {
                 let t0 = Instant::now();
                 let mut p = self.progress.lock().unwrap();
-                while !p.stop && b >= p.released + self.sets {
+                while !p.stop && p.released < self.need[b] {
                     p = self.moved.wait(p).unwrap();
                 }
                 p.set_wait_ns += t0.elapsed().as_nanos() as u64;
@@ -202,6 +406,7 @@ impl Pass {
             ram_gib = gib(self.ram_bytes),
             read_gib = gib(self.read_bytes),
             batches = self.batches,
+            ring = self.ring,
             read = p.read,
             read_s = s(p.read_ns),
             read_gib_s = gib(self.read_bytes) / s(p.read_ns).max(1e-9),
@@ -263,18 +468,57 @@ impl HostTier {
                     .collect()
             })
             .collect();
-        let (mut srcs, batches) = plan_pass(&held, inner.slots, inner.places, inner.sets)?;
-        // A place's index is the layer's own ([`Inner::place_at`]).
+        let (mut srcs, mut batches) = plan_pass(&held, inner.slots, inner.places, inner.sets)?;
         let first = inner.slots + GAP;
-        for ((il, _), s) in layers.iter().zip(&mut srcs) {
-            for src in s.iter_mut() {
-                if let PassSrc::Read { at, .. } = src
-                    && let Some(p) = at.checked_sub(first)
-                {
-                    *at = first + inner.place_at(*il, p);
+        let ring = if ring_mode() {
+            let geo: Vec<Geo> = layers
+                .iter()
+                .map(|&(il, _)| {
+                    let mem = &inner.layers[il];
+                    Geo {
+                        first: mem.first,
+                        end: mem.second + inner.places,
+                        stage: mem.stage,
+                        bytes: mem.bytes,
+                    }
+                })
+                .collect();
+            ring_places(&batches, &geo, inner.places, inner.sets)?
+        } else {
+            None
+        };
+        let in_ring = ring.is_some();
+        let need = if let Some((at, need)) = ring {
+            for (b, (batch, at)) in batches.iter_mut().zip(at).enumerate() {
+                let mut at = at.into_iter();
+                for (l, i, to) in batch.iter_mut() {
+                    if let To::Place(_) = to {
+                        let q = at.next().ok_or("a staged pass ring lost a place")?;
+                        *to = To::At(q);
+                        srcs[*l][*i] = PassSrc::Read {
+                            batch: b,
+                            at: first + q,
+                        };
+                    }
                 }
             }
-        }
+            need
+        } else {
+            // A place's index is the layer's own ([`Inner::place_at`]).
+            for ((il, _), s) in layers.iter().zip(&mut srcs) {
+                for src in s.iter_mut() {
+                    if let PassSrc::Read { at, .. } = src
+                        && let Some(p) = at.checked_sub(first)
+                    {
+                        *at = first + inner.place_at(*il, p);
+                    }
+                }
+            }
+            // Batch `b` takes the set batch `b - sets` took.
+            (0..batches.len())
+                .map(|b| (b + 1).saturating_sub(inner.sets))
+                .collect()
+        };
         let per = |il: usize| inner.layers[il].bytes.iter().sum::<usize>() as u64;
         let (mut ram_experts, mut ram_bytes) = (0usize, 0u64);
         for ((il, _), s) in layers.iter().zip(&srcs) {
@@ -297,7 +541,7 @@ impl HostTier {
                             loads += 1;
                             slots.extend(reads);
                         }
-                        To::Place(_) => places.extend(reads),
+                        To::Place(_) | To::At(_) => places.extend(reads),
                     }
                 }
                 (slots, places)
@@ -312,7 +556,8 @@ impl HostTier {
         let pass = Arc::new(Pass {
             progress: Mutex::new(Progress::default()),
             moved: Condvar::new(),
-            sets: inner.sets,
+            need,
+            ring: in_ring,
             batches: batches.len(),
             layers: layers.len(),
             ram_experts,
