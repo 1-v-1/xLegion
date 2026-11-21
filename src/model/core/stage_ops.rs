@@ -34,6 +34,9 @@ pub(crate) const PURE: &[&str] = &[
     "hc_lo_act",
     "hc_combine",
     "hc_rms_mul",
+    // The speed projection's node (`--speed-projection`): one kernel; its device tables are
+    // uploaded at graph-build time, so the launch reads pointers that never move.
+    "cvec_project",
     "ple_gate",
     "ple_conv",
     "qsa_pool_mask",

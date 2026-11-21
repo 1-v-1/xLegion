@@ -823,6 +823,21 @@ pub(super) struct ModelArgs {
     /// contiguous split. Every rank must pass the same file. Off by default.
     #[arg(long, requires = "tp_moe_ep", value_name = "FILE")]
     pub tp_moe_ep_place: Option<PathBuf>,
+    /// qwen4exp (Qwen3.8-Flash-Next): drop one direction from every hyper-connection stream
+    /// after each steered layer's FFN write (`h -= s · (h · v) · v`, per-layer directions).
+    /// `on` loads the vector bundled with Legion (`data/speed-projection/`, steers layers
+    /// 4-44, Strata's `--experimental-speed-projection on` profile); a path loads another
+    /// `controlvector` GGUF (llama.cpp's format) and steers every layer it carries; `off`
+    /// (default) runs the stock model. The bundled vector is a refusal-direction projection:
+    /// the model declines far fewer requests, and removing refusals removes a safety
+    /// behaviour - you are responsible for what the model writes with it on. The tables live
+    /// on each device the model runs on and only steered layers build a projection node (and
+    /// fold their FFN write one mixer earlier than the fused combine would), so the rest of
+    /// the model runs untouched; other architectures ignore the flag, and a vector of another
+    /// model's width warns and steps aside. A `--tp-overlap` step runs its split layers as
+    /// micro-batches, which do not project. Experimental.
+    #[arg(long, value_name = "on|off|FILE", default_value = "off")]
+    pub speed_projection: String,
     /// Appends every MoE layer's router choices (the top-k expert ids of each token of each
     /// step, decode, prompts and MTP drafts alike) to FILE, for `legion ep-place`. Each step's
     /// ids are copied to the host before the step goes on, so the server runs slower while
@@ -2013,6 +2028,43 @@ pub fn bind_numa(args: &ServeArgs) -> anyhow::Result<Option<Placement>> {
         .map_err(anyhow::Error::msg)
 }
 
+/// `--speed-projection`: load the control vector [`cvec`] before the model builds any graph.
+/// `off` (default) loads nothing; `on` takes the vector bundled in the repo and the range its
+/// package recommends; anything else names another `controlvector` GGUF, steering every layer
+/// it carries. A file the qwen4exp stack cannot use is a start-up error, not a silent drop.
+fn load_speed_projection(choice: &str, tp_overlap: legion::tp_net::Overlap) -> anyhow::Result<()> {
+    use legion::model::qwen4::cvec;
+    let (bytes, name, range) = match choice {
+        "off" | "" => return Ok(()),
+        "on" => (
+            std::borrow::Cow::Borrowed(cvec::BUNDLED),
+            "data/speed-projection/Qwen3.8-Flash-Next-experimental-speed-projection.gguf"
+                .to_string(),
+            cvec::BUNDLED_RANGE,
+        ),
+        path => {
+            let p = std::path::Path::new(path);
+            let bytes = std::fs::read(p)
+                .map_err(|e| anyhow::anyhow!("--speed-projection: cannot read {path}: {e}"))?;
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string());
+            // Every layer the file carries; the stack ignores a layer it does not have.
+            (std::borrow::Cow::Owned(bytes), name, (1, usize::MAX))
+        }
+    };
+    let summary = cvec::load(&bytes, &name, range).map_err(|e| anyhow::anyhow!("{e}"))?;
+    tracing::info!("speed projection (experimental): {summary}");
+    if !matches!(tp_overlap, legion::tp_net::Overlap::Off) {
+        tracing::warn!(
+            "speed projection: a --tp-overlap step runs its split layers as micro-batches, \
+             which build no projection nodes"
+        );
+    }
+    Ok(())
+}
+
 pub async fn run(
     args: ServeArgs,
     numa: Option<Placement>,
@@ -2075,6 +2127,10 @@ pub async fn run(
         EngineKind::Model => {
             let spec = e.spec()?;
             let switches = e.model.served_switches();
+            // Speed projection (`--speed-projection`): load the control vector once at
+            // startup so the qwen4exp stack projects the steered layers. Device-agnostic:
+            // the tables upload to each device at first graph build (`cvec::project`).
+            load_speed_projection(&e.model.speed_projection, e.model.tp_overlap)?;
             if e.model.switches.stage_graphs_given() && !e.model.stage_graphs() {
                 tracing::warn!(
                     "--stage-graphs: not with --tp, --pair-tp or --glm-parallel-decode; off"

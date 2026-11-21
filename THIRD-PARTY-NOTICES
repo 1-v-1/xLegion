@@ -325,3 +325,15 @@ The full text of the Apache License, Version 2.0 follows.
       of your accepting any such warranty or additional liability.
 
    END OF TERMS AND CONDITIONS
+
+===============================================================================
+Bundled data (not code)
+===============================================================================
+
+Qwen3.8-Flash-Next experimental speed projection
+  data/speed-projection/Qwen3.8-Flash-Next-experimental-speed-projection.gguf (+ .json, README.md)
+  Copied from Strata (https://github.com/Niko1221/Strata,
+  terminal/data/experimental-speed-projection/), which packages a published
+  control vector made from Qwen3.8-Flash-Next activations; the Qwen Community
+  License 1.0 of the model applies to it. A refusal-direction projection:
+  see the README beside the file for what turning it on does.

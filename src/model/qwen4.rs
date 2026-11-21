@@ -23,6 +23,7 @@
 //!   `KvPool`); a pool's key is computed once, in the step that completes it. Up to `top_k`
 //!   tokens every visible key is selected, so the result equals dense attention.
 
+pub mod cvec;
 pub mod hc;
 mod hc_chain;
 pub mod hc_down;
@@ -1478,6 +1479,16 @@ impl Model {
             let ffn = self.tp_sum_split(ctx, ffn, sp.filter(|_| split));
             tap.tap("ffn_out", il, ffn);
             pending = Some((ffn, inject));
+            // Speed projection (`--speed-projection`, [`cvec`]): this is the point right
+            // after the layer's FFN write. The combine is deferred in this engine, so fold
+            // it here and project the streams: the next mixer then reads the projected
+            // streams, as in the engine this feature was ported from. (Layers a `--tp-overlap`
+            // step runs through `micro_layer` take no projection; serve warns about the mix.)
+            if cvec::steered(il) {
+                res = flush(res, &mut pending);
+                let w = self.w(&format!("blk.{il}.hc_attn_up.weight"))?;
+                res = cvec::project(ctx, il, res, w)?;
+            }
             if tap.on {
                 res = flush(res, &mut pending);
             }

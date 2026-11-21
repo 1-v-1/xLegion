@@ -2,3 +2,4 @@
 *.gguf
 !tests/data/*.gguf
 __pycache__/
+!data/speed-projection/*.gguf
