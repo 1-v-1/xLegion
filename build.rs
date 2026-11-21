@@ -283,6 +283,7 @@ fn build_cuda_kernels(ggml: &Path) {
         .file("src/cuda/qsa_attn.cu")
         .file("src/cuda/moe_gemm.cu")
         .file("src/cuda/qwen4_hc.cu")
+        .file("src/cuda/cvec.cu")
         .file("src/cuda/fp8_mm.cu")
         .file("src/cuda/fp8_act.cu")
         .file("src/cuda/fp8_block.cu")
