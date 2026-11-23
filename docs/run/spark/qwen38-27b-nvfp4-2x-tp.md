@@ -31,13 +31,28 @@ legion serve \
   --prefill-chunk 16384 \
   --tp-profile 1 \
   --tp-rails 2 \
+  --tp-draft-split \
   --tp-rank 0 \
   --tp-peers <rank0-ip>:7619,<rank1-ip>:7619
 # rank 1: the same without --port, with --tp-rank 1
 ```
 
-Deterministic client: the same 8 fixed prompts as the 1x row, temperature 0, 256 tokens each (2026-11-19, one
-session, the build before the halves below). 1 user 36.6 (story) to 80.4 (code), median 50.2, mean accepted length 3.36; 136.1 tok/s at 4 users
+Deterministic client: the same 8 fixed prompts as the 1x row, temperature 0, 256 tokens each (2026-11-23, two
+sessions, 2 rounds each, with everything below that has no flag). 1 user 37.7 (story) to 81.7 (code), median
+51.6-51.8 per round, mean accepted length 3.37, the same tokens in every round; 141.0 tok/s at 4 users (the median
+of 4 rounds, 140.3-144.0); 302.2 at 16 users (289.8-311.8). Prefill 8K 3,377-3,406 (median 3,393) and 32K
+3,153-3,161 (3,159) tok/s, two requests each per session after an 8K warm-up, from the same servers. 123K was not
+measured. The 2026-11-21 measurement, before the FFN sums in four pieces and the FP8-MLP layers in parts: prefill
+8K 3,048 and 32K 2,842, 1 user median 51.4-51.7, 140.1 at 4 users, 301.7 at 16 users. vLLM 0.33.0 TP2 (2026-11-20, [its command](../other-engines.md#qwen38-27b)): 1 user 37.5-75.5 (median
+49.0), 125.6 at 4 users, 248.0 at 16 users, prefill 8K 2,913 and 32K 2,757.
+
+`--tp-draft-split` (2026-11-21): the drafter's FFN and head split over the two Sparks. Against the command without
+it (same build, two sessions in ABBA order): 1 user median 49.4 -> 51.7 (+4.7%, the same 1-user text), 4 users
+139.2 -> 142.6, 16 users 287.9 -> 298.7; prefill ties since prompt steps read back only the rows the drafter takes
+in (#1133). Before `--tp-draft-split` (2026-11-21 morning): 1 user median 49.2-49.8, 136.9 at 4 users, 295.9 at
+16 users, prefill 8K 3,002 and 32K 2,780.
+
+The first measurement (2026-11-19, one session, the build before the halves below): 1 user 36.6 (story) to 80.4 (code), median 50.2, mean accepted length 3.36; 136.1 tok/s at 4 users
 (2 rounds: 136.4 / 135.8); 283.1 at 16 users (282.9 / 283.4). Prefill 8K 2,074 / 2,008 and 32K 1,794 / 1,939
 tok/s, one request each after an 8K warm-up, from the same server. 123K was not measured. Against the 1x row,
 decode gains 47% at 1 user (median 34.1), 40% at 4 users (97.5) and 20% at 16 users (235.2), but prefill is
@@ -73,6 +88,19 @@ after / before): prefill 8K 2,418-2,447 / 2,542-2,575, 2,535-2,583 / 2,404-2,451
 not change (1 user 48.5-48.7, 4 users 126.8-127.7, 16 users 270.3-273.1), and text and log probabilities are the
 same bits.
 
+Half 1's FFN then runs in three parts, 5/8, 1/4 and 1/8 of its tokens, so the last sum of each layer that travels
+with nothing left to compute is an eighth of the halves' (#1133, no flag; an 8K step goes 4,096 + 2,560 + 1,024 +
+512, and parts under 512 tokens are not made: a 4K step's half 1 goes in 1,536 + 512). With the command above,
+two sessions in ABBA order, a fresh server per arm (halves = `LEGION_DEBUG_QWEN35_TP_PARTS=2` on both ranks):
+prefill 8K about 3,050 -> 3,255 tok/s (+6.7%) and 32K about 2,848 -> 3,028 (+6.4%); half 1 in two parts (`=3`)
+gets 3,225 and 2,990. Decode does not change (1 user 49.2-50.1 in every arm), and the output is the same bits: the
+same log probabilities for 8K and 32K prompts and the same 1-user text.
+
+The FP8-MLP layers 56-63 take the same halves and parts since 2026-11-22 (they ran whole before;
+`LEGION_DEBUG_QWEN35_TP_FP8_PARTS=0` on both ranks keeps them whole). Two sessions in ABBA order, a fresh server per
+arm: prefill 8K 3,230-3,257 -> 3,361-3,397 tok/s (+4.1%) and 32K 3,028-3,044 -> 3,140-3,168 (+3.8%); 1 user ties,
+and the 8K and 32K log probabilities and the 1-user text are the same bits.
+
 Optional, output-moving: `--tp-wire bf16` on both ranks sends sums of at least 1 MiB in BF16, half the bytes:
 prompt steps, the 16-user verify steps and short prompts (all ranks still agree). On top of the command above
 (same session day, one session): prefill 8K 2,676 / 2,728 and 32K 2,252 / 2,539 tok/s (an 8K prompt step on rank 0
@@ -86,8 +114,9 @@ With `gdn_scan` on the ranks (the build before its final launch shape, which is 
 
 - `--max-seqs` (`16`): How many requests are decoded at once (continuous batching). Set to the highest concurrency the benchmark uses.
 - `--ctx-size` (`262144`), `--kv-cache-tokens` (`262144`), `--prefix-cache-states` (`0`): as in the [1x command](qwen38-27b-nvfp4-1x.md#what-each-flag-does).
-- `--spec` (`dflash`) and the next ten flags: as in the [1x command](qwen38-27b-nvfp4-1x.md#what-each-flag-does). Under tensor parallelism the DFlash drafter runs on rank 0 only, between verify steps.
+- `--spec` (`dflash`) and the next ten flags: as in the [1x command](qwen38-27b-nvfp4-1x.md#what-each-flag-does). Under tensor parallelism the DFlash drafter runs between verify steps, split over both ranks with `--tp-draft-split` (below).
 - `--tp-profile` (`1`): Logs where step time goes (compute, waiting for the other rank, sends) every N steps. Measurement only, not needed for normal use.
 - `--tp-rails` (`2`): Each Spark's QSFP port is two RDMA devices, one per PCIe link of about 108 Gb/s. With `2`, sums of at least 1 MiB go in 1 MiB pieces over both devices instead of only the one on the `--tp-peers` address (the second needs no IP address). The same bytes arrive, so output does not change.
+- `--tp-draft-split`: each Spark holds half of every drafter layer's FFN rows and both run each draft round (one sum per drafter layer); with greedy drafts and the Q4 head (`--spec-draft-weights q4`) the head is split too, each rank taking the top candidates of half the vocabulary. Rank 1 no longer waits while rank 0 drafts. The sums run in another order, so drafts can differ in bits (output-moving at 4 and 16 users; the 1-user text above is the same). Both ranks pass it.
 - `--tp-rank` (`0`): This process's rank in tensor parallelism across machines (one process per DGX Spark). Rank 0 serves HTTP.
 - `--tp-peers`: Every rank's `ip:port` on the QSFP link, in rank order, identical on all ranks.

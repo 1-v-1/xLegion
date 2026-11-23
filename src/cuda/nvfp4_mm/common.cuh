@@ -190,11 +190,11 @@ constexpr int BK = 64, STAGES = 3;
 // 0, 4, 8 or 12 bytes into the first), conflict-free for the fragment reads.
 constexpr int LDW = 48;
 constexpr int LDX = BK + 8;  // smem BF16 per token row: 144 bytes (conflict-free ldmatrix)
-template <int MI, int NT> __host__ __device__ constexpr int stage_bytes() {
-    return 128 * MI * LDW + 8 * NT * LDX * 2;
+template <int MI, int NT, int WARPS = 8> __host__ __device__ constexpr int stage_bytes() {
+    return 16 * WARPS * MI * LDW + 8 * NT * LDX * 2;
 }
-template <int MI, int NT, int ST = STAGES> __host__ __device__ constexpr int smem_bytes() {
-    return ST * stage_bytes<MI, NT>();  // 90 KiB for MI = 2, NT = 16, three stages
+template <int MI, int NT, int ST = STAGES, int WARPS = 8> __host__ __device__ constexpr int smem_bytes() {
+    return ST * stage_bytes<MI, NT, WARPS>();  // 90 KiB for MI = 2, NT = 16, three stages
 }
 static_assert(smem_bytes<2, 16>() <= 96 * 1024, "shared memory");
 
@@ -362,11 +362,12 @@ __device__ __forceinline__ bool find_tile(const int32_t * offs, int n_expert, in
 constexpr int DIAG_NODEC = 1, DIAG_NOMMA = 2, DIAG_NOEPI = 4, DIAG_NOW = 8, DIAG_NOX = 16, DIAG_NOK = 64,
               DIAG_PF16 = 256, DIAG_PF4 = 512, DIAG_PF8 = 1024, DIAG_PF32 = 2048, DIAG_CAW = 4096,
               DIAG_CAX = 8192;
-template <int MI, int NT, bool GROUPED, bool GLU, int ST = STAGES, int MINB = 1, int DIAG = 0>
-__global__ void __launch_bounds__(256, MINB) nvfp4_gemm(const legion_nvfp4_mm p) {
+template <int MI, int NT, bool GROUPED, bool GLU, int ST = STAGES, int MINB = 1, int DIAG = 0, int WARPS = 8>
+__global__ void __launch_bounds__(WARPS * 32, MINB) nvfp4_gemm(const legion_nvfp4_mm p) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     static_assert(!GLU || MI == 2, "SwiGLU: gate and up tiles");
-    constexpr int BM = 128 * MI, BN = 8 * NT, W_STAGE = BM * LDW, STAGE = stage_bytes<MI, NT>();
+    constexpr int THREADS = WARPS * 32;
+    constexpr int BM = 16 * WARPS * MI, BN = 8 * NT, W_STAGE = BM * LDW, STAGE = stage_bytes<MI, NT, WARPS>();
     constexpr int BM_OUT = GLU ? BM / 2 : BM;  // output rows per tile
     extern __shared__ __align__(16) unsigned char smem[];
     __shared__ int64_t x_off[GROUPED ? BN : 1], d_off[GROUPED ? BN : 1];
@@ -407,7 +408,7 @@ __global__ void __launch_bounds__(256, MINB) nvfp4_gemm(const legion_nvfp4_mm p)
                 const int64_t rows = min((int64_t) BM_OUT, p.m - m0);
                 for (int j = spare; j < skipped; j += n_spare) {
                     const int64_t off = (int64_t) p.plan[p.n_expert + 1 + routed + j] * p.m + m0;
-                    for (int64_t r = threadIdx.x; r < rows; r += 256) {
+                    for (int64_t r = threadIdx.x; r < rows; r += THREADS) {
                         if (GLU) {
                             ((__nv_bfloat16 *) p.dst)[off + r] = __float2bfloat16_rn(0.0f);
                         } else {
@@ -467,9 +468,9 @@ __global__ void __launch_bounds__(256, MINB) nvfp4_gemm(const legion_nvfp4_mm p)
         // word stops at the block's end, so nothing past it is read; the bytes before the block
         // in the first word are the same row's (or, at its first block, the previous row's).
 #pragma unroll
-        for (int i = 0; i < (BM * 3 + 255) / 256; i++) {
-            const int c = threadIdx.x + i * 256;
-            if (!(DIAG & DIAG_NOW) && (BM * 3 % 256 == 0 || c < BM * 3)) {
+        for (int i = 0; i < (BM * 3 + THREADS - 1) / THREADS; i++) {
+            const int c = threadIdx.x + i * THREADS;
+            if (!(DIAG & DIAG_NOW) && (BM * 3 % THREADS == 0 || c < BM * 3)) {
                 const int r = c / 3, part = c % 3;
                 const uint8_t * start = row_src(r) + step * 36;
                 const uint8_t * src = (const uint8_t *) ((uintptr_t) start & ~(uintptr_t) 15) + part * 16;
@@ -478,9 +479,9 @@ __global__ void __launch_bounds__(256, MINB) nvfp4_gemm(const legion_nvfp4_mm p)
             }
         }
 #pragma unroll
-        for (int i = 0; i < (BN * 8 + 255) / 256; i++) {
-            const int c = threadIdx.x + i * 256;
-            if (!(DIAG & DIAG_NOX) && (BN * 8 % 256 == 0 || c < BN * 8)) {
+        for (int i = 0; i < (BN * 8 + THREADS - 1) / THREADS; i++) {
+            const int c = threadIdx.x + i * THREADS;
+            if (!(DIAG & DIAG_NOX) && (BN * 8 % THREADS == 0 || c < BN * 8)) {
                 const int t = c / 8, col = c % 8 * 8;
                 const bool ok = t < n_tok;
                 const int64_t off = !ok ? 0 : GROUPED ? x_off[t] : (n0 + t) * p.x_ld;
@@ -687,6 +688,260 @@ __global__ void __launch_bounds__(256, MINB) nvfp4_gemm(const legion_nvfp4_mm p)
             }
         }
     }
+    }
+#else
+    __trap();  // device_supported() launches it on compute capability 8.0+ only
+#endif
+}
+
+// The dense streaming GEMM of 33-64 tokens (#1181: a verify step of 5-8 users' drafts). At these
+// batches the matrix has one token tile, so its rows are all the parallelism there is: a CTA per
+// SM, as many warps as the rows give each SM (vs_warps), every warp 16 * RTW weight rows by all
+// 64 tokens over the whole of k, the CTA looping over its row tiles. The weights come in stages
+// of VS_SB blocks per row (144-byte runs, 16-byte copies, two stages), the activations in stages
+// of XB blocks (XS of them in flight), shared by all the CTA's warps: the activations are read
+// from L2 once per SM instead of once per 64 or 128 rows.
+// Every output is nvfp4_gemm's MMA chain: one m16n8k16 per 16 of k, in order, from the same A
+// fragments (the same decode of the same bytes) and B fragments (the same ldmatrix of the same
+// activations), started from zero and scaled the same way; so the bits are nvfp4_gemm's for any
+// tile shape. GLU: RTW is 2 and each warp's first 16-row tile is the gate's rows, its second the
+// same rows of the up weight (p.w2), as nvfp4_gemm's GLU tiles.
+// Needs w_ld % 16 == 0 and 16-byte aligned weights (the launch falls back to nvfp4_gemm).
+// DIAG (legion nvfp4-mv-bench --dense only): DIAG_NOW / DIAG_NOX / DIAG_NOMMA as nvfp4_gemm's.
+constexpr int VS_SB = 4;                // blocks per weight stage: 144 bytes of a row
+constexpr int VS_LDS = VS_SB * 36;      // smem bytes per weight row and stage (36 words: no bank conflicts)
+constexpr int VS_MAX_ROWS = 192;        // weight rows per CTA at most
+constexpr int VS_SMEM_MAX = 99 * 1024;  // an sm_120 / sm_121 CTA's shared memory
+__host__ __device__ constexpr int vs_ldx(int xb) {
+    return xb * BK + 8;  // BF16 per token row of an activation stage (conflict-free ldmatrix)
+}
+__host__ __device__ constexpr int vs_smem(int wrows, int xb, int xs) {
+    return xs * 64 * vs_ldx(xb) * 2 + 2 * wrows * VS_LDS;
+}
+
+template <int RTW, bool GLU, int XB, int XS, int DIAG>
+__global__ void __launch_bounds__(VS_MAX_ROWS / (16 * RTW) * 32, 1) nvfp4_vstream(const legion_nvfp4_mm p) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    static_assert(!GLU || RTW == 2, "SwiGLU: gate and up tiles");
+    // A weight stage is issued with the activation stage XS - 1 ahead of the one at its first
+    // block, so it is complete by then when XS - 1 activation stages cover at most one weight stage.
+    static_assert(VS_SB % XB == 0 && XS >= 2 && (XS - 1) * XB <= VS_SB, "stages");
+    constexpr int NT = 8, BN = 8 * NT, LDXS = vs_ldx(XB), XSTAGE = 64 * LDXS;  // XSTAGE in BF16
+    constexpr int OW = GLU ? 16 : 16 * RTW;                                     // output rows per warp
+    extern __shared__ __align__(16) unsigned char smem[];
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int threads = blockDim.x, warps = threads / 32;
+    const int wrows = warps * 16 * RTW;
+    __nv_bfloat16 * xsm = (__nv_bfloat16 *) smem;
+    unsigned char * wsm = smem + XS * XSTAGE * 2;
+    const int64_t n0 = (int64_t) blockIdx.y * BN;
+    const int n_tok = (int) min((int64_t) BN, p.n - n0);
+    const float sc = (p.scale ? *p.scale : 1.0f) * 1024.0f;  // 2^10 undoes the decoding's 2^-10
+    const float sc2 = (p.scale2 ? *p.scale2 : 1.0f) * 1024.0f;
+    const int nblk = (int) (p.k / BK);
+    const int nu = (nblk + XB - 1) / XB;
+    const int64_t row_bytes = (int64_t) nblk * 36;
+
+    // Weight row r of the row tile at m0 (rows past m: row 0, never stored).
+    auto w_row = [&](int64_t m0, int r, bool & ok) -> const uint8_t * {
+        const int64_t row = GLU ? m0 + r / 32 * 16 + r % 16 : m0 + r;
+        ok = row < p.m;
+        return (GLU && r / 16 % 2 ? p.w2 : p.w) + (ok ? row : 0) * p.w_ld;
+    };
+    // Weight stage q (blocks VS_SB * q on) of every row into slot q % 2.
+    auto load_w = [&](int64_t m0, int q) {
+        unsigned char * dst = wsm + (q % 2) * wrows * VS_LDS;
+        const int64_t off = (int64_t) q * VS_LDS;
+        constexpr int CH = VS_LDS / 16;
+#pragma unroll
+        for (int i = 0; i < (16 * RTW * CH + 31) / 32; i++) {
+            const int c = threadIdx.x + i * threads;
+            if (c < wrows * CH) {
+                const int r = c / CH, part = c % CH;
+                bool ok;
+                const uint8_t * row = w_row(m0, r, ok);
+                const int64_t left = row_bytes - off - part * 16;
+                const int bytes = ok ? (int) max((int64_t) 0, min((int64_t) 16, left)) : 0;
+                cp_async16_n(dst + r * VS_LDS + part * 16, bytes > 0 ? row + off + part * 16 : row, bytes);
+            }
+        }
+    };
+    // Activation stage u (blocks XB * u on) of the tile's tokens into slot u % XS (tokens past
+    // the last one and blocks past k: zeros).
+    auto load_x = [&](int u) {
+        __nv_bfloat16 * xs = xsm + (u % XS) * XSTAGE;
+        const int cols = min(XB, nblk - u * XB) * BK;
+        for (int c = threadIdx.x; c < BN * 8 * XB; c += threads) {
+            const int t = c / (8 * XB), col = c % (8 * XB) * 8;
+            const bool ok = t < n_tok && col < cols;
+            const int64_t off = ok ? (n0 + t) * p.x_ld + (int64_t) u * XB * BK + col : 0;
+            cp_async16(xs + t * LDXS + col, p.x + off, ok);
+        }
+    };
+    // Each row's next 32 blocks in one L2 bulk prefetch (nvfp4_gemm's dense runs).
+    auto prefetch = [&](int64_t m0, int b) {
+#if __CUDA_ARCH__ >= 900
+        for (int r = threadIdx.x; !(DIAG & DIAG_NOW) && r < wrows && b < nblk; r += threads) {
+            bool ok;
+            const uint8_t * row = w_row(m0, r, ok);
+            if (ok) {
+                const uintptr_t a = (uintptr_t) (row + (int64_t) b * 36);
+                const uintptr_t e = a + min(32, nblk - b) * 36;
+                const uintptr_t a16 = a & ~(uintptr_t) 15;
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(a16),
+                             "r"((uint32_t) ((e - a16 + 15) & ~(uintptr_t) 15)));
+            }
+        }
+#endif
+    };
+
+    float acc[RTW][NT][4];
+    // One block's MMAs (nvfp4_gemm's mma_stage): ws, this warp's rows' block in the weight slot;
+    // xs, the block's activations. FULL: a tile of BN tokens.
+    auto mma_block = [&](const unsigned char * ws, const __nv_bfloat16 * xs, auto full) {
+        constexpr bool FULL = decltype(full)::value;
+        const unsigned char * rows[RTW][2];
+        uint32_t ssc[RTW][2];
+#pragma unroll
+        for (int i = 0; i < RTW; i++)
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+                rows[i][h] = ws + (warp * 16 * RTW + i * 16 + h * 8 + lane / 4) * VS_LDS;
+                ssc[i][h] = scale_bf16x2(rows[i][h][lane % 4]);
+            }
+#pragma unroll
+        for (int s = 0; s < 4; s++) {
+            uint32_t a[RTW][4];
+#pragma unroll
+            for (int i = 0; i < RTW; i++)
+#pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    const uint32_t q = *(const uint16_t *) (rows[i][h] + 4 + 8 * s + 2 * (lane % 4));
+                    const uint32_t d = __shfl_sync(0xffffffffu, ssc[i][h], (lane & ~3) | s);
+                    uint32_t lo, hi;
+                    codes_bf16x2(__byte_perm(q, 0, 0x4140), lo, hi);
+                    a[i][h] = mul_bf16x2(lo, d);
+                    a[i][2 + h] = mul_bf16x2(hi, d);
+                }
+            uint32_t b[NT][2];
+#pragma unroll
+            for (int j = 0; j < NT / 2; j++) {
+                if (!FULL && j * 16 >= n_tok) {
+                    break;
+                }
+                const int tok = j * 16 + lane % 8 + (lane / 16) * 8;
+                const __nv_bfloat16 * src = xs + tok * LDXS + s * 16 + ((lane / 8) % 2) * 8;
+                const uint32_t addr = (uint32_t) __cvta_generic_to_shared(src);
+                asm("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                    : "=r"(b[2 * j][0]), "=r"(b[2 * j][1]), "=r"(b[2 * j + 1][0]), "=r"(b[2 * j + 1][1])
+                    : "r"(addr));
+            }
+#pragma unroll
+            for (int i = 0; i < RTW; i++)
+#pragma unroll
+                for (int j = 0; j < NT; j++) {
+                    if (FULL || j * 8 < n_tok) {
+                        if constexpr ((DIAG & DIAG_NOMMA) != 0) {
+                            asm volatile("" ::"r"(a[i][0]), "r"(a[i][1]), "r"(a[i][2]), "r"(a[i][3]), "r"(b[j][0]),
+                                         "r"(b[j][1]));
+                        } else {
+                            mma(acc[i][j], a[i], b[j][0], b[j][1]);
+                        }
+                    }
+                }
+        }
+    };
+
+    const int64_t rows_out = (int64_t) warps * OW;
+    for (int tile = blockIdx.x; tile < p.tiles_m; tile += gridDim.x) {
+        const int64_t m0 = (int64_t) tile * rows_out;
+#pragma unroll
+        for (int i = 0; i < RTW; i++)
+#pragma unroll
+            for (int j = 0; j < NT; j++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) acc[i][j][e] = 0.0f;
+        prefetch(m0, 0);
+        prefetch(m0, 32);
+        // Groups: the prologue's XS - 1 (activation stages 0 .. XS - 2, weight stage 0 with the
+        // first), then one per iteration u (activation stage u + XS - 1; at a weight stage's
+        // first block, the next weight stage).
+#pragma unroll
+        for (int s = 0; s < XS - 1; s++) {
+            if (s == 0 && !(DIAG & DIAG_NOW)) {
+                load_w(m0, 0);
+            }
+            if (s < nu && !(DIAG & DIAG_NOX)) {
+                load_x(s);
+            }
+            asm volatile("cp.async.commit_group;\n" ::);
+        }
+        for (int u = 0; u < nu; u++) {
+            asm volatile("cp.async.wait_group %0;\n" ::"n"(XS - 2));
+            __syncthreads();
+            if (u + XS - 1 < nu && !(DIAG & DIAG_NOX)) {
+                load_x(u + XS - 1);
+            }
+            if (u * XB % VS_SB == 0 && (u * XB / VS_SB + 1) * VS_SB < nblk && !(DIAG & DIAG_NOW)) {
+                load_w(m0, u * XB / VS_SB + 1);
+            }
+            asm volatile("cp.async.commit_group;\n" ::);
+            if (u > 0 && u * XB % 32 == 0) {
+                prefetch(m0, u * XB + 32);
+            }
+#pragma unroll
+            for (int bi = 0; bi < XB; bi++) {
+                const int b = u * XB + bi;
+                if (b >= nblk) {
+                    break;
+                }
+                const unsigned char * ws = wsm + (b / VS_SB % 2) * wrows * VS_LDS + b % VS_SB * 36;
+                const __nv_bfloat16 * xs = xsm + (u % XS) * XSTAGE + bi * BK;
+                if (n_tok == BN) {
+                    mma_block(ws, xs, std::true_type{});
+                } else {
+                    mma_block(ws, xs, std::false_type{});
+                }
+            }
+        }
+        asm volatile("cp.async.wait_group 0;\n" ::);
+        __syncthreads();  // every warp is done with the stages before the next tile's copies
+
+        if constexpr (GLU) {
+            const int64_t r0 = m0 + warp * 16 + lane / 4;
+#pragma unroll
+            for (int j = 0; j < NT; j++) {
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int64_t row = r0 + (e / 2) * 8;
+                    const int t = j * 8 + (lane % 4) * 2 + e % 2;
+                    if (row < p.m && t < n_tok) {
+                        float gate = acc[0][j][e] * sc, up = acc[1][j][e] * sc2;
+                        if (p.limit > 0.0f) {
+                            gate = fminf(gate, p.limit);
+                            up = fminf(fmaxf(up, -p.limit), p.limit);
+                        }
+                        ((__nv_bfloat16 *) p.dst)[(n0 + t) * p.m + row] = __float2bfloat16_rn(glu_gate(gate, p.act) * up);
+                    }
+                }
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < RTW; i++) {
+                const int64_t r0 = m0 + warp * 16 * RTW + i * 16 + lane / 4;
+#pragma unroll
+                for (int j = 0; j < NT; j++) {
+#pragma unroll
+                    for (int e = 0; e < 4; e++) {
+                        const int64_t row = r0 + (e / 2) * 8;
+                        const int t = j * 8 + (lane % 4) * 2 + e % 2;
+                        if (row < p.m && t < n_tok) {
+                            store_out(p, (n0 + t) * p.m + row, acc[i][j][e] * sc);
+                        }
+                    }
+                }
+            }
+        }
     }
 #else
     __trap();  // device_supported() launches it on compute capability 8.0+ only
@@ -1205,6 +1460,143 @@ int gemm_tuned(const legion_nvfp4_mm & p, cudaStream_t st) {
     }
 }
 
+// The dense GEMM's tiles of 33-64 tokens (#1181) in other shapes: WARPS warps of 16 * MI rows
+// (16 * WARPS * MI rows per CTA), ST stages, MINB CTAs per SM. Every output is the default
+// kernel's MMAs over k in the same order, so the same bits. -1 where the stages do not fit.
+template <int MI, int NT, bool GLU, int ST, int MINB, int WARPS>
+int gemm_dense(const legion_nvfp4_mm & p, cudaStream_t st) {
+    constexpr int SMEM = smem_bytes<MI, NT, ST, WARPS>();
+    constexpr int PER_CTA = SMEM + 16 + 1024;
+    if constexpr (SMEM > 99 * 1024 || MINB * PER_CTA > 100 * 1024) {
+        return -1;
+    } else {
+        if (p.plan) {
+            return -1;
+        }
+        const unsigned grid = (unsigned) p.tiles_m * (unsigned) p.tiles_n;
+        auto kernel = nvfp4_gemm<MI, NT, false, GLU, ST, MINB, 0, WARPS>;
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+        if (MINB > 1) {
+            cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                 cudaSharedmemCarveoutMaxShared);
+        }
+        kernel<<<grid, WARPS * 32, SMEM, st>>>(p);
+        return status();
+    }
+}
+
+// gemm_dense's variants: WARPS * 1000 + ST * 10 + MINB (WARPS 4 or 8). 64-token tiles only.
+template <int MI, int NT, bool GLU>
+int gemm_dense_variant(const legion_nvfp4_mm & p, int variant, cudaStream_t st) {
+    if constexpr (NT == 8) {
+        switch (variant) {
+            case 8032: return gemm_dense<MI, NT, GLU, 3, 2, 8>(p, st);
+            case 8041: return gemm_dense<MI, NT, GLU, 4, 1, 8>(p, st);
+            case 8022: return gemm_dense<MI, NT, GLU, 2, 2, 8>(p, st);
+            case 4031: return gemm_dense<MI, NT, GLU, 3, 1, 4>(p, st);
+            case 4032: return gemm_dense<MI, NT, GLU, 3, 2, 4>(p, st);
+            case 4023: return gemm_dense<MI, NT, GLU, 2, 3, 4>(p, st);
+            case 4042: return gemm_dense<MI, NT, GLU, 4, 2, 4>(p, st);
+            default: return -1;
+        }
+    }
+    return -1;
+}
+
+// A CTA of fewer warps streams no faster per warp: an SM's weight stream needs about this many
+// warps' copies in flight. GB10, the fused GLU over 10752 rows (a rank's half of Gemma 4 31B's
+// 21504 over two machines) at 33-64 tokens: 2 warps (the fewest warp-rounds without this floor)
+// 811 us, the GEMM's default 561 us.
+constexpr int VS_MIN_WARPS = 4;
+
+// Warps per CTA of nvfp4_vstream over `units` warp tiles on `sms` SMs: the fewest warp-rounds
+// (rounds of every SM's CTA times its warps, a CTA counted as at least VS_MIN_WARPS; ties: more
+// warps), within the shared memory.
+inline int vs_warps(int64_t units, int sms, int rtw, int xb, int xs) {
+    int best = 0;
+    int64_t cost = INT64_MAX;
+    for (int w = 1; w * 16 * rtw <= VS_MAX_ROWS && vs_smem(w * 16 * rtw, xb, xs) <= VS_SMEM_MAX; w++) {
+        const int64_t per = (int64_t) w * sms;
+        const int64_t c = (units + per - 1) / per * (w < VS_MIN_WARPS ? VS_MIN_WARPS : w);
+        if (c <= cost) {
+            cost = c;
+            best = w;
+        }
+    }
+    return best;
+}
+
+// nvfp4_vstream's launch: the CTA size from the rows and the SM count (p.tiles_m set here, to
+// its row tiles), one CTA per SM; `fw` > 0: CTAs of that many warps instead (the bench's; -1
+// when they do not fit). Weights not 16-byte aligned (rows or base): nvfp4_gemm's default
+// instead (p.tiles_m as the caller set it for that).
+template <int RTW, bool GLU, int XB, int XS, int DIAG>
+int vstream(const legion_nvfp4_mm & p0, cudaStream_t st, int fw = 0) {
+    constexpr int MI = GLU ? 2 : 1;
+    if (p0.plan) {
+        return -1;
+    }
+    if (p0.w_ld % 16 != 0 || ((uintptr_t) p0.w | (uintptr_t) (GLU ? p0.w2 : p0.w)) % 16 != 0) {
+        return gemm<MI, 8, GLU>(p0, st);
+    }
+    const int sm_count = legion_cuda_sm_count();
+    const int sms = sm_count > 0 ? sm_count : 1;
+    const int64_t ow = GLU ? 16 : 16 * RTW;
+    const int warps = fw > 0 ? fw : vs_warps((p0.m + ow - 1) / ow, sms, RTW, XB, XS);
+    if (warps == 0 || warps * 16 * RTW > VS_MAX_ROWS || vs_smem(warps * 16 * RTW, XB, XS) > VS_SMEM_MAX) {
+        return -1;
+    }
+    legion_nvfp4_mm p = p0;
+    const int64_t rows = warps * ow;
+    p.tiles_m = (int32_t) ((p.m + rows - 1) / rows);
+    const int smem = vs_smem(warps * 16 * RTW, XB, XS);
+    auto kernel = nvfp4_vstream<RTW, GLU, XB, XS, DIAG>;
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    const dim3 grid((unsigned) (p.tiles_m < sms ? p.tiles_m : sms), (unsigned) p.tiles_n);
+    kernel<<<grid, warps * 32, smem, st>>>(p);
+    return status();
+}
+
+// nvfp4_vstream's variants (GemmTune::stream in src/model/nvfp4_mm.rs): variant % 1000 == 99,
+// variant / 1000 = RTW + 10 * XB + 100 * XS + 1000 * diagnostic (1: DIAG_NOW | DIAG_NOX, 2:
+// DIAG_NOMMA, 3: DIAG_NOW, 4: DIAG_NOX; the bench's) + 10000 * CTA warps (0: vs_warps'; the
+// bench's). 64-token tiles: the plain matmul (MI 1) and the fused GLU (MI 2, RTW 2). -2: not
+// such a variant; -1: not compiled.
+template <int MI, int NT, bool GLU>
+int vstream_variant(const legion_nvfp4_mm & p, int variant, cudaStream_t st) {
+    if (variant < 1000 || variant % 1000 != 99) {
+        return -2;
+    }
+    if constexpr (NT == 8 && MI == (GLU ? 2 : 1)) {
+        const int v = variant / 1000 % 10000;
+        const int fw = variant / 10000000;
+        if constexpr (GLU) {
+            switch (v) {
+                case 412: return vstream<2, true, 1, 4, 0>(p, st, fw);
+                case 312: return vstream<2, true, 1, 3, 0>(p, st, fw);
+                case 322: return vstream<2, true, 2, 3, 0>(p, st, fw);
+                default: return -1;
+            }
+        } else {
+            switch (v) {
+                case 411: return vstream<1, false, 1, 4, 0>(p, st, fw);
+                case 311: return vstream<1, false, 1, 3, 0>(p, st, fw);
+                case 321: return vstream<1, false, 2, 3, 0>(p, st, fw);
+                case 412: return vstream<2, false, 1, 4, 0>(p, st, fw);
+                case 322: return vstream<2, false, 2, 3, 0>(p, st, fw);
+                case 1411: return vstream<1, false, 1, 4, DIAG_NOW | DIAG_NOX>(p, st);
+                case 2411: return vstream<1, false, 1, 4, DIAG_NOMMA>(p, st);
+                case 3411: return vstream<1, false, 1, 4, DIAG_NOW>(p, st);
+                case 4411: return vstream<1, false, 1, 4, DIAG_NOX>(p, st);
+                case 1412: return vstream<2, false, 1, 4, DIAG_NOW | DIAG_NOX>(p, st);
+                case 3412: return vstream<2, false, 1, 4, DIAG_NOW>(p, st);
+                default: return -1;
+            }
+        }
+    }
+    return -1;
+}
+
 // The bench's prefetch runs (legion nvfp4-gemm-bench, nvfp4-mv-bench --dense; #1176 r36):
 // variant tune + 100 * DIAG_PF*, the tune's kernel with the weights' L2 prefetch in runs of
 // 4 / 8 / 16 / 32 blocks, the same sums. Compiled for the tiles prefill uses: 128 tokens (the
@@ -1270,8 +1662,14 @@ int gemm_l1(const legion_nvfp4_mm & p, int & variant, cudaStream_t st) {
 // tiles. 100 and up: gemm_pf's prefetch runs and gemm_l1's L1 copies.
 template <int MI, int NT, bool GLU>
 int gemm_variant(const legion_nvfp4_mm & p, int variant, cudaStream_t st) {
+    if (const int r = vstream_variant<MI, NT, GLU>(p, variant, st); r != -2) {
+        return r;
+    }
     if (const int r = gemm_l1<MI, NT, GLU>(p, variant, st); r != -2) {
         return r;
+    }
+    if (variant >= 1000) {
+        return gemm_dense_variant<MI, NT, GLU>(p, variant, st);
     }
     if (variant >= 100) {
         return gemm_pf<MI, NT, GLU>(p, variant, st);

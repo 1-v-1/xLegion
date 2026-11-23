@@ -1897,6 +1897,30 @@ impl Model {
         self.tp_pair.is_some() || self.tp_comm.is_some()
     }
 
+    /// [`Self::tp_sum`] of `x` (a step of `n` tokens) with the first bytes of `ws` (the weights
+    /// the GPU reads next, in its order; `together`: one kernel reads them all at once) read
+    /// into L2 on the side stream while this rank waits for the others' partials
+    /// ([`l2_prefetch::tp`], #1181), forked between its send and its wait. Over machines
+    /// (`--tp-rank`, not a GPU pair) where [`l2_prefetch::tp::plan`] takes it, else the plain
+    /// sum; the same bits either way.
+    pub(crate) fn tp_sum_ahead<'a>(
+        &self,
+        ctx: &'a Context,
+        x: Tensor<'a>,
+        n: i64,
+        ws: &[Tensor<'a>],
+        together: bool,
+    ) -> Tensor<'a> {
+        let Some(c) = self.tp_net_comm() else {
+            return self.tp_sum(ctx, x);
+        };
+        let plan = l2_prefetch::tp::plan(ws, n, together);
+        if plan.is_empty() {
+            return self.tp_sum(ctx, x);
+        }
+        crate::tp_net::all_reduce_ahead(ctx, c, x, None, &plan)
+    }
+
     pub fn set_attention(&mut self, a: Attention) {
         self.attention = a;
     }
@@ -4467,6 +4491,19 @@ impl Model {
         };
         let scale = linear::scale_name(&name).and_then(|s| self.w(&s).ok());
         self.linear.a4_dense(&name, w, scale, n)
+    }
+
+    /// Whether layer `il`'s weight `name` runs [`Self::mm`] on a batch of `n` tokens as the FP8
+    /// W8A8 GEMM with per-token activation scales ([`linear::Linear::fp8_dense`]: every token
+    /// the same bits at every such batch).
+    pub(crate) fn fp8_dense(&self, il: usize, name: &str, n: i64) -> bool {
+        let name = format!("blk.{il}.{name}");
+        let Ok(w) = self.w(&name) else {
+            return false;
+        };
+        let base = name.strip_suffix(".weight").unwrap_or(&name);
+        let has_input_scale = self.w(&format!("{base}.input_scale")).is_ok();
+        self.linear.fp8_dense(&name, w, has_input_scale, n)
     }
 
     pub(crate) fn moe<'a>(

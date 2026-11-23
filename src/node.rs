@@ -28,7 +28,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// Frames before this version are refused: both ranks must run the same build.
-const VERSION: u32 = 13;
+const VERSION: u32 = 15;
 
 /// The node settings of a `legion serve` (`--node-rank`, `--node-peer`, `--node-split`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,7 +120,13 @@ pub enum Request {
     /// the one row of `rows`, their values). `rows_dev`: 0, or `n + 1` when rank 0 leaves
     /// its captured rows on the device for the MTP head's take-in of a prompt chunk and reads
     /// back only rows `n` on (#1176): this rank does the same where it can, and the take-in's
-    /// pieces name those rows as [`RowsPart::Device`].
+    /// pieces name those rows as [`RowsPart::Device`]. `rows_from`: the first captured row
+    /// rank 0 reads back (0: all), for a DFlash drafter that takes in only a prompt chunk's
+    /// last rows (its ring, #1133): this rank reads back the same rows, the ones its share of
+    /// the drafter (`--tp-draft-split`) takes in. `draft_dev`: rank 0 leaves a decode or verify
+    /// step's captured rows on the device for its share of the DFlash drafter
+    /// (`--tp-draft-split`, #1133): this rank does the same where its share reads them there,
+    /// and the draft round after the step takes them in from there.
     TpStep {
         groups: Vec<WireGroup>,
         micro: u32,
@@ -128,6 +134,8 @@ pub enum Request {
         gather_budget: u64,
         head: u32,
         rows_dev: u64,
+        rows_from: u64,
+        draft_dev: bool,
     },
     /// Save ring `ring`'s first `n` positions in copy `slot`, or (`restore`) put that copy
     /// back.
@@ -547,6 +555,8 @@ impl Request {
                 gather_budget,
                 head: share,
                 rows_dev,
+                rows_from,
+                draft_dev,
             } => {
                 put_groups(&mut head, &groups);
                 put_u32(&mut head, micro);
@@ -554,6 +564,8 @@ impl Request {
                 head.extend_from_slice(&gather_budget.to_le_bytes());
                 put_u32(&mut head, share);
                 head.extend_from_slice(&rows_dev.to_le_bytes());
+                head.extend_from_slice(&rows_from.to_le_bytes());
+                head.push(u8::from(draft_dev));
                 K_TP_STEP
             }
             Request::SaveRing {
@@ -710,6 +722,8 @@ impl Request {
                 gather_budget: r.u64()?,
                 head: r.u32()?,
                 rows_dev: r.u64()?,
+                rows_from: r.u64()?,
+                draft_dev: r.u8()? != 0,
             },
             K_SAVE_RING => Request::SaveRing {
                 ring: r.u32()?,
@@ -1112,9 +1126,24 @@ impl Link {
     /// Reads every reply still owed and returns the last one; an error reply (of any of
     /// them) is the error.
     pub fn wait(&mut self) -> Result<Reply, String> {
+        self.drain(0)?
+            .ok_or_else(|| "no request to wait for".into())
+    }
+
+    /// Reads the replies owed but the last `left` (the requests sent last, which may still
+    /// run on rank 1): nothing when no more are owed. An error reply among them is the error.
+    pub fn wait_older(&mut self, left: usize) -> Result<(), String> {
+        self.drain(left).map(|_| ())
+    }
+
+    /// Reads the replies owed until `left` are, and returns the last one read.
+    fn drain(&mut self, left: usize) -> Result<Option<Reply>, String> {
         let mut last = None;
         let mut err = None;
-        while let Some(sent) = self.pending.pop_front() {
+        while self.pending.len() > left {
+            let Some(sent) = self.pending.pop_front() else {
+                break;
+            };
             let r = self.read_reply()?;
             let waited = |ms: f32| (sent.elapsed().as_secs_f64() * 1e3 - f64::from(ms)).max(0.0);
             match &r {
@@ -1141,7 +1170,7 @@ impl Link {
         }
         match err {
             Some(e) => Err(format!("node rank 1: {e}")),
-            None => last.ok_or_else(|| "no request to wait for".into()),
+            None => Ok(last),
         }
     }
 

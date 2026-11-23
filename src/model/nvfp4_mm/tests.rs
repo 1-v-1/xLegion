@@ -321,6 +321,70 @@ fn gemm_tune_codes() {
     assert!(gemm_tune_fits(2, 16, GemmTune::from_code(21)));
     assert!(!gemm_tune_fits(2, 16, GEMM_DOWN));
     assert!(!gemm_tune_fits(2, 16, GemmTune::from_code(41)));
+    // The dense GEMM's 64-token tiles (#1181): warps in the thousands.
+    assert_eq!(GEMM_VERIFY.code(), 4042);
+    for v in [4031, 4042, 8032, 8041] {
+        assert_eq!(GemmTune::from_code(v).code(), v);
+    }
+    assert_eq!(GEMM_VERIFY.rows(128), 64);
+    assert_eq!(GemmTune::from_code(8041).rows(128), 128);
+    assert_eq!(GEMM_DEFAULT.rows(256), 256);
+    assert!(!gemm_tune_fits(1, 8, GEMM_VERIFY));
+    // The streaming GEMM (#1181): its own code space (... 99), the default's rows.
+    assert_eq!(GEMM_STREAM.code(), 411_099);
+    assert_eq!(GEMM_STREAM_GLU.code(), 412_099);
+    for t in [GEMM_STREAM, GEMM_STREAM_GLU, GemmTune::stream(1, 2, 3)] {
+        assert!(t.is_stream());
+        assert_eq!(GemmTune::from_code(t.code()), t);
+        assert_eq!(t.rows(128), 128);
+        assert!(!gemm_tune_fits(1, 8, t));
+    }
+    // A diagnostic variant (the bench's): the thousands above the shape.
+    assert_eq!(GemmTune::from_code(1_411_099).warps, 1411);
+    // CTAs of a set warp count (the bench's): ten thousands above the shape, still the stream.
+    assert_eq!(GemmTune::from_code(60_412_099).warps, 60_412);
+    assert!(GemmTune::from_code(120_411_099).is_stream());
+    assert!(!GEMM_VERIFY.is_stream() && !GEMM_DEFAULT.is_stream());
+}
+
+#[test]
+fn dense_gemm_tune_at_33_64_tokens() {
+    // Gemma 4 31B's verify steps of 5-8 users (33-64 rows): the streaming GEMM from 4096
+    // rows and for the fused GLU; the down projection (21504:5376, rows 4x as long as it has
+    // rows) on #180's tune up to 48 tokens.
+    for n in 33..=64 {
+        assert_eq!(
+            pick_dense(5376, 8192, n, 48, MV_MAX_N),
+            Kernel::Gemm { mi: 1, nt: 8 }
+        );
+        assert_eq!(dense_gemm_tune(5376, 8192, n, 8, false), GEMM_STREAM);
+        assert_eq!(dense_gemm_tune(5376, 4096, n, 8, false), GEMM_STREAM);
+        assert_eq!(dense_gemm_tune(4096, 5376, n, 8, false), GEMM_STREAM);
+        assert_eq!(dense_gemm_tune(5376, 16384, n, 8, false), GEMM_STREAM);
+        assert_eq!(dense_gemm_tune(5376, 2048, n, 8, false), GEMM_DEFAULT);
+        assert_eq!(dense_gemm_tune(5376, 21504, n, 8, true), GEMM_STREAM_GLU);
+        // o 8192:5376 and a rank's down 10752:5376 over two machines: the stream.
+        assert_eq!(dense_gemm_tune(8192, 5376, n, 8, false), GEMM_STREAM);
+        assert_eq!(dense_gemm_tune(10752, 5376, n, 8, false), GEMM_STREAM);
+        let down = if n <= STREAM_LONG_K_MAX_N {
+            GEMM_VERIFY
+        } else {
+            GEMM_STREAM
+        };
+        assert_eq!(dense_gemm_tune(21504, 5376, n, 8, false), down, "n {n}");
+        // Past GEMM_VERIFY's rows: the stream still.
+        assert_eq!(dense_gemm_tune(65536, 16384, n, 8, false), GEMM_STREAM);
+    }
+    for n in [1, 32, 65, 128, 4096] {
+        assert_eq!(
+            dense_gemm_tune(5376, 8192, n, tokens_tile(n, 16).max(4), false),
+            GEMM_DEFAULT
+        );
+        assert_eq!(
+            dense_gemm_tune(5376, 21504, n, tokens_tile(n, 16).max(4), true),
+            GEMM_DEFAULT
+        );
+    }
 }
 
 #[test]

@@ -431,8 +431,13 @@ pub(super) fn check_exec(exec: &Executor, host_tier: bool) -> Result<(), LoadErr
 }
 
 /// Rank 0: connects to the other ranks once they have loaded and makes `exec` lead them.
-/// Returns the KV blocks every rank keeps (the fewest of any).
-pub(super) fn lead(exec: &mut Executor, start: Start, n_blocks: usize) -> Result<usize, LoadError> {
+/// Returns the KV blocks every rank keeps (the fewest of any) and the pinned exchange buffers
+/// made at load ([`tp_net::presize_buffers`]).
+pub(super) fn lead(
+    exec: &mut Executor,
+    start: Start,
+    n_blocks: usize,
+) -> Result<(usize, Option<tp_net::Presized>), LoadError> {
     let n_layer = exec.model().hp.n_layer;
     // Every rank's rings must hold rank 0's whole-image steps (#1217).
     let image_step = exec.image_step();
@@ -445,6 +450,7 @@ pub(super) fn lead(exec: &mut Executor, start: Start, n_blocks: usize) -> Result
         Ok(r) => Err(device(format!("rank {to} answered hello with {r:?}"))),
         Err(e) => Err(device(format!("rank {to}: {e}"))),
     };
+    let mut presized = None;
     let n = match start.via {
         Via::Net { cfg, comm, .. } => {
             let n = cfg.n_ranks();
@@ -453,13 +459,16 @@ pub(super) fn lead(exec: &mut Executor, start: Start, n_blocks: usize) -> Result
                 let s = tp_net::dial_control(&cfg, to, WAIT)
                     .map_err(|e| device(format!("rank {to}: {e}")))?;
                 let mut link = Link::over(s).map_err(|e| device(format!("rank {to}: {e}")))?;
-                hello(
-                    link.call(crate::node::tp_hello(n, to, n_layer, n_blocks, image_step)),
-                    to,
-                    &mut blocks,
-                )?;
+                link.send(crate::node::tp_hello(n, to, n_layer, n_blocks, image_step))
+                    .map_err(|e| device(format!("rank {to}: {e}")))?;
                 links.push(link);
             }
+            // Every rank makes its pinned exchange buffers on the hello, together (#1133).
+            let made = presize(comm.comm());
+            for (link, to) in links.iter_mut().zip(1..) {
+                hello(link.wait(), to, &mut blocks)?;
+            }
+            presized = made.map_err(device)?;
             serve_rows(exec, &cfg);
             let mut lead = TpLead::new(links, comm, cfg.profile);
             lead.set_mtp_chains(cfg.mtp_chain);
@@ -503,7 +512,23 @@ pub(super) fn lead(exec: &mut Executor, start: Start, n_blocks: usize) -> Result
         kv_cache_tokens = blocks * crate::model::core::KV_BLOCK,
         "tensor parallelism over machines: rank 0 leads"
     );
-    Ok(blocks)
+    Ok((blocks, presized))
+}
+
+/// This rank's part of [`tp_net::presize_buffers`] (#1133), logged.
+fn presize(comm: &tp_net::Comm) -> Result<Option<tp_net::Presized>, String> {
+    let made = tp_net::presize_buffers(comm).map_err(|e| format!("pinned TP buffers: {e}"))?;
+    if let Some(p) = made {
+        tracing::info!(
+            rank = comm.rank(),
+            mib = p.bytes >> 20,
+            buffer_mib = p.cap >> 20,
+            sets = p.sets,
+            seconds = format!("{:.2}", p.seconds),
+            "tensor parallelism over machines: pinned exchange buffers made for the largest step"
+        );
+    }
+    Ok(made)
 }
 
 /// A rank above 0: answers rank 0's requests with `exec` until rank 0 disconnects (the
@@ -598,6 +623,55 @@ struct FollowRows {
     /// The last step's left on the device ([`crate::model::core::StepOutput::hidden_dev`],
     /// [`RowsPart::Device`]): valid until the next step.
     dev: Vec<crate::ggml::RowsAt>,
+    /// The last step's first row read back to `host[0]` (`TpStep`'s `rows_from`, #1133): the
+    /// rows before it hold anything.
+    from: usize,
+    /// A draft round read rows the last step did not read back (warned once).
+    warned: bool,
+    /// DFlash prompt chunks' take-in-only rounds left for the next round that runs at once,
+    /// with their steps' rows, oldest first (`--tp-draft-split`, [`super::draft_defer`]).
+    held: Vec<HeldRound>,
+}
+
+/// A draft round left for later on this rank's share of the drafter, with its step's rows.
+type HeldRound = (Vec<crate::node::WireDraft>, Vec<Vec<f32>>);
+
+/// `seq` is gone: its requests leave the held rounds, and rounds left with none go.
+fn release_held(held: &mut Vec<HeldRound>, seq: u64) {
+    held.retain_mut(|(reqs, _)| {
+        reqs.retain(|r| r.seq != seq);
+        !reqs.is_empty()
+    });
+}
+
+impl FollowRows {
+    /// A step starts: the rows no request names any more, which its copies go into
+    /// ([`Executor::recycle_rows`]). Rank 0's MTP passes name at most the last two steps' rows,
+    /// so the step before the last's go; with `last_only` (a draft round reads only the last
+    /// step's, `--tp-draft-split`) the last step's go too, as rank 0 hands its own back after
+    /// its round (#1133). The last step's rows on the device are this step's buffers again.
+    fn start_step(&mut self, last_only: bool) -> Vec<Vec<f32>> {
+        self.dev.clear();
+        if last_only {
+            let mut gone = std::mem::take(&mut self.host[0]);
+            gone.append(&mut self.host[1]);
+            return gone;
+        }
+        self.host.swap(0, 1);
+        std::mem::take(&mut self.host[0])
+    }
+}
+
+/// A rank above 0 with its share of the DFlash drafter (`--tp-draft-split`) hands a step's
+/// captured rows back when the next step starts, as rank 0 hands its own back after the draft
+/// round ([`FollowRows::start_step`], #1133). It kept the last two steps' rows, as for MTP
+/// passes, so a long prompt's last chunks (the ones its drafter takes in) copied theirs into
+/// new vectors more often than rank 0's did: their pages faulted in, and vectors beyond the
+/// spare ones kept were unmapped again. `LEGION_DEBUG_TP_DRAFT_RECYCLE=0` on that rank keeps
+/// the last two again (for A/B runs only).
+fn draft_recycle() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEGION_DEBUG_TP_DRAFT_RECYCLE").is_none_or(|v| v != "0"))
 }
 
 /// [`Request::TpMtpRows`]' parts split into the ones [`rows_of`] reads and a last
@@ -683,13 +757,15 @@ fn groups_of<'a>(
 const NO_DRAFT_SPLIT: &str = "a draft round of --tp-draft-split: pass it on every rank";
 
 /// Rank 0's draft round `reqs` (`--tp-draft-split`) on this rank's share of the drafter: the
-/// same passes with the same rows (`step`, the last step's captured layers, `w` floats a row),
-/// their drafts dropped (rank 0 picks). The drafter reads a sequence's length and last token
-/// only: the tokens before it are zeros here.
+/// same passes with the same rows (`step`, the last step's captured layers, `w` floats a row;
+/// or `dev`, the same layers left on the device, when the step left them there), their drafts
+/// dropped (rank 0 picks). The drafter reads a sequence's length and last token only: the
+/// tokens before it are zeros here.
 fn run_draft(
     d: &mut dyn crate::spec::ModelDrafter,
     reqs: &[crate::node::WireDraft],
     step: &[Vec<f32>],
+    dev: &[crate::ggml::RowsAt],
     w: usize,
 ) -> Result<(), String> {
     let tokens: Vec<Vec<u32>> = reqs
@@ -705,11 +781,14 @@ fn run_draft(
     for ((r, tokens), out) in reqs.iter().zip(&tokens).zip(&mut outs) {
         let (off, ran) = (r.off as usize, r.ran as usize);
         // Rows past the last step's: none, which the drafter's round refuses after it has run
-        // its sums (rank 0's round waits for them), not before.
-        let hidden = step
-            .iter()
-            .map(|h| h.get(off * w..(off + ran) * w).unwrap_or_default())
-            .collect();
+        // its sums (rank 0's round waits for them), not before. On the device: none here.
+        let hidden = if dev.is_empty() {
+            step.iter()
+                .map(|h| h.get(off * w..(off + ran) * w).unwrap_or_default())
+                .collect()
+        } else {
+            Vec::new()
+        };
         batch.push(crate::spec::DraftRequest {
             seq: r.seq,
             tokens,
@@ -720,7 +799,35 @@ fn run_draft(
             out,
         });
     }
-    d.step(&mut batch)
+    if dev.is_empty() {
+        return d.step(&mut batch);
+    }
+    // A decode or verify step's rows where the step graph wrote them (#1133): each request's
+    // from its first row among the step's, as rank 0's drafter takes in its own.
+    let first: Vec<usize> = reqs.iter().map(|r| r.off as usize).collect();
+    let rows = crate::spec::DeviceHidden {
+        layers: dev,
+        first: &first,
+    };
+    d.step_device(&mut batch, &rows)
+}
+
+/// The first request of draft round `reqs` that takes in rows its step did not read back here
+/// (the step's rows before `from`, `TpStep`'s `rows_from`, #1133): `read_from` gives the first
+/// of a request's rows this rank's drafter reads ([`crate::spec::ModelDrafter::rows_read_from`]
+/// of the request's tokens). `None` when the drafters of every rank keep the same ring (rank 0
+/// named the first row its own drafter reads).
+fn first_unread(
+    reqs: &[crate::node::WireDraft],
+    from: usize,
+    read_from: impl Fn(&crate::node::WireDraft) -> usize,
+) -> Option<u64> {
+    if from == 0 {
+        return None;
+    }
+    reqs.iter()
+        .find(|r| r.ran > 0 && (r.off as usize).saturating_add(read_from(r)) < from)
+        .map(|r| r.seq)
 }
 
 fn handle(
@@ -740,6 +847,11 @@ fn handle(
             n_blocks,
             image_step,
         } => {
+            // With rank 0 and the other ranks, before anything else (#1133): rank 0 sent every
+            // rank its hello first.
+            if let Sums::Net(c) = comm {
+                presize(c.comm())?;
+            }
             crate::node::check_tp_hello((version, n_ranks, rank, n_layer), mine)?;
             let window = exec.model().hp.arch.swa_window();
             crate::node::check_tp_image_step(exec.kv_ring(), window, image_step as usize)?;
@@ -762,6 +874,8 @@ fn handle(
             gather_budget,
             head,
             rows_dev,
+            rows_from,
+            draft_dev,
         } => {
             exec.set_pipeline_micro(micro as usize);
             exec.set_micro_taper(taper as usize);
@@ -783,18 +897,24 @@ fn handle(
             }
             let t0 = std::time::Instant::now();
             comm.mark_step(profile);
-            // The rows of the step before the last are not read any more (rank 0 names at most
-            // the last two steps' rows): this step copies into them.
-            rows.host.swap(0, 1);
-            exec.recycle_rows(std::mem::take(&mut rows.host[0]));
-            // The last step's rows on the device are this step's buffers again.
-            rows.dev.clear();
+            // The rows no request names any more: this step copies into them.
+            exec.recycle_rows(rows.start_step(drafter.is_some() && draft_recycle()));
             // Rank 0's take-in copies its pieces' rows on the device: so do this rank's, where
             // the step can leave them there (else they are all read back, as before).
             if let Some(from) = rows_dev.checked_sub(1) {
                 exec.set_hidden_on_device(exec.mtp_rows_device());
                 exec.set_hidden_on_device_from(from as usize);
+            } else if draft_dev && let Some(d) = drafter.as_ref() {
+                // A decode or verify step's rows for this rank's share of the drafter: on the
+                // device where it reads them there, as rank 0 leaves its own (#1133).
+                exec.set_hidden_on_device(d.reads_device_rows());
             }
+            // A DFlash prompt step: the rows from rank 0's first one read back on, the ones
+            // this rank's share of the drafter takes in (#1133); a 16K step of a 32K prompt
+            // read 1.7 GB back here (five captured layers), its last 4,096 rows or none now.
+            let rows_from = rows_from as usize;
+            exec.set_hidden_from(rows_from);
+            rows.from = rows_from;
             let out = exec.step(&groups).map_err(|e| e.to_string())?;
             rows.host[0] = out.hidden;
             rows.dev = out.hidden_dev;
@@ -990,11 +1110,58 @@ fn handle(
         Request::TpDraft { reqs } => {
             let d = drafter.as_mut().ok_or(NO_DRAFT_SPLIT)?;
             let w = exec.model().hp.n_embd as usize;
-            run_draft(d.as_mut(), &reqs, &rows.host[0], w)?;
+            // Rank 0 named the first row its drafter reads; this rank's reads the same ones
+            // unless its ring differs (another --ctx-size or drafter window here). Its drafts
+            // then differ (rank 0 still verifies them): said once, the round runs anyway, so
+            // that its sums line up with rank 0's.
+            if !rows.warned
+                && let Some(seq) = first_unread(&reqs, rows.from, |r| {
+                    let n = r.base as usize + r.tokens.len();
+                    d.rows_read_from(n, r.start as usize, r.ran as usize)
+                })
+            {
+                rows.warned = true;
+                tracing::warn!(
+                    seq,
+                    from = rows.from,
+                    "--tp-draft-split: this rank's drafter takes in rows rank 0's does not \
+                     (another --ctx-size or drafter window on this rank?): its drafts may differ"
+                );
+            }
+            // A round of prompt chunks' take-ins only waits for the next round, which runs it
+            // first, as rank 0's does (#1133): the last chunk's step no longer waits for it
+            // here. Every rank decides by itself; such a round has no sums.
+            let wait = rows.held.len() < super::draft_defer::MAX_ROUNDS
+                && super::draft_defer::defers(
+                    super::draft_defer::on(),
+                    !rows.dev.is_empty(),
+                    reqs.iter().map(|r| r.max as usize),
+                    reqs.iter().map(|r| {
+                        let n = r.base as usize + r.tokens.len();
+                        let ran = r.ran as usize;
+                        (d.rows_read_from(n, r.start as usize, ran), ran)
+                    }),
+                );
+            if wait {
+                let step = std::mem::take(&mut rows.host[0]);
+                rows.held.push((reqs, step));
+                return Ok(Reply::Done);
+            }
+            // The held ones first, in their order; one that fails still lets this round run,
+            // whose sums rank 0 waits for.
+            let mut left = Ok(());
+            for (held, step) in std::mem::take(&mut rows.held) {
+                left = left.and(run_draft(d.as_mut(), &held, &step, &[], w));
+                exec.recycle_rows(step);
+            }
+            let ran = run_draft(d.as_mut(), &reqs, &rows.host[0], &rows.dev, w);
+            left?;
+            ran?;
             Reply::Done
         }
         Request::TpDraftRelease { seq } => {
             drafter.as_mut().ok_or(NO_DRAFT_SPLIT)?.release(seq);
+            release_held(&mut rows.held, seq);
             Reply::Done
         }
         Request::Hello { .. }

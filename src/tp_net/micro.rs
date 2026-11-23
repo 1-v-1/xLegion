@@ -282,18 +282,91 @@ pub fn finish<'a>(ctx: &'a Context, s: Started<'a>, into: Option<Tensor<'a>>) ->
         // of its own and keeps `t` alive while the view is used.
         // SAFETY: a fresh node, not allocated yet; `t` is a node of the same graph, ahead of
         // it (one of its sources) and of its shape.
-        unsafe {
-            let raw = out.raw();
-            (*raw).view_src = t.raw();
-            (*raw).view_offs = 0;
-        }
+        unsafe { view_into(out, t) };
     }
     out
 }
 
-/// The params after [`Params::list`]'s that [`finish_add`] sets: whether the node adds a
-/// residual (its source 2) and the column of its output it writes from.
+/// Points the fresh node `out` at `t`'s memory (`t` one of its sources, ahead of it, of its
+/// size): `t`'s own, or, where `t` is itself a finish into another ([`finish_add`] of three or
+/// more parts, #1133), the memory `t` views. ggml's allocator frees a tensor once its readers
+/// and the views naming it as `view_src` are done, so a view must name the tensor that owns
+/// the memory, as ggml's own views do; the source keeps the finishes in order.
+///
+/// # Safety
+/// `out` is a fresh node, not allocated yet; `t` a node of the same graph ahead of it.
+unsafe fn view_into<'a>(out: Tensor<'a>, t: Tensor<'a>) {
+    // SAFETY: the caller's.
+    unsafe {
+        let (raw, t) = (out.raw(), t.raw());
+        let (src, offs) = if (*t).view_src.is_null() {
+            (t, 0)
+        } else {
+            ((*t).view_src, (*t).view_offs)
+        };
+        (*raw).view_src = src;
+        (*raw).view_offs = offs;
+    }
+}
+
+/// The params after [`Params::list`]'s that [`finish_add`] and [`finish_cols`] set: whether the
+/// node adds a residual (its source 2; [`ADD_RES`], or [`ADD_COLS`] for columns only) and the
+/// column of its output it writes from.
 const ADD_PARAMS: usize = 6;
+
+/// [`ADD_PARAMS`]' first value of a [`finish_add`] (or [`finish_add_norm`]): a residual.
+const ADD_RES: i32 = 1;
+
+/// [`ADD_PARAMS`]' first value of a [`finish_cols`]: no residual, the sums from a column.
+const ADD_COLS: i32 = 2;
+
+/// The finish of the all-reduce `s` ([`all_reduce_start`]) into columns `at..at + cols` of an
+/// output of `width` columns (`cols` its source's): [`finish`]'s sums, the same bits, without a
+/// residual (Gemma 4's attention output, whose norm comes before its residual add, #1181). With
+/// `into` (a [`finish_cols`] of the same `width` ahead of this one, holding the other columns)
+/// the output is a view of `into`'s memory, so that parts of a step's tokens end in one tensor
+/// without a concatenation. Columns no finish writes are undefined.
+pub fn finish_cols<'a>(
+    ctx: &'a Context,
+    s: Started<'a>,
+    width: i64,
+    at: i64,
+    into: Option<Tensor<'a>>,
+) -> Tensor<'a> {
+    assert!(
+        s.p.reduce,
+        "tp micro exchange: only an all-reduce writes into columns"
+    );
+    let [row, cols] = [s.x.ne()[0], s.x.ne()[1]];
+    assert!(
+        at >= 0 && at + cols <= width,
+        "tp micro exchange: columns {at}..{} of {width}",
+        at + cols
+    );
+    let mut args = vec![s.x, s.node];
+    if let Some(t) = into {
+        assert_eq!(
+            t.ne(),
+            [row, width, 1, 1],
+            "tp micro exchange: the shared output"
+        );
+        assert!(
+            t.is_contiguous(),
+            "tp micro exchange: a contiguous shared output"
+        );
+        args.push(t);
+    }
+    let mut p = s.p.list().to_vec();
+    p.extend([ADD_COLS, at as i32]);
+    let out = ctx.external_with(&FINISH, types::F32, [row, width, 1, 1], &args, &p);
+    if let Some(t) = into {
+        // As in `finish`: the node writes its columns into `t`'s memory.
+        // SAFETY: a fresh node, not allocated yet; `t` is a node of the same graph, ahead of
+        // it (one of its sources) and of its shape.
+        unsafe { view_into(out, t) };
+    }
+    out
+}
 
 /// The finish of the all-reduce `s` ([`all_reduce_start`]) with `res` (F32, `s`'s source's
 /// shape `[row, cols]`) added to every sum, after the partials, in the sum's kernel (#1133 r2):
@@ -345,17 +418,13 @@ pub fn finish_add<'a>(
         args.push(t);
     }
     let mut p = s.p.list().to_vec();
-    p.extend([1, at as i32]);
+    p.extend([ADD_RES, at as i32]);
     let out = ctx.external_with(&FINISH, types::F32, [row, width, 1, 1], &args, &p);
     if let Some(t) = into {
         // As in `finish`: the node writes its columns into `t`'s memory.
         // SAFETY: a fresh node, not allocated yet; `t` is a node of the same graph, ahead of
         // it (one of its sources) and of its shape.
-        unsafe {
-            let raw = out.raw();
-            (*raw).view_src = t.raw();
-            (*raw).view_offs = 0;
-        }
+        unsafe { view_into(out, t) };
     }
     out
 }
@@ -411,18 +480,14 @@ pub fn finish_add_norm<'a>(
         args.push(t);
     }
     let mut p = s.p.list().to_vec();
-    p.extend([1, at as i32]);
+    p.extend([ADD_RES, at as i32]);
     p.extend(norm.params());
     let out = ctx.external_with(&FINISH, types::I8, [total as i64, 1, 1, 1], &args, &p);
     if let Some(t) = into {
         // As in `finish`: the node writes its parts into `t`'s memory.
         // SAFETY: a fresh node, not allocated yet; `t` is a node of the same graph, ahead of
         // it (one of its sources) and of its size.
-        unsafe {
-            let raw = out.raw();
-            (*raw).view_src = t.raw();
-            (*raw).view_offs = 0;
-        }
+        unsafe { view_into(out, t) };
     }
     out
 }
@@ -431,7 +496,7 @@ pub fn finish_add_norm<'a>(
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) fn norm_of(dst: &ffi::ggml_tensor) -> Option<(super::op::NormParams, usize)> {
     let p = external_params(dst);
-    if p[ADD_PARAMS] == 0 {
+    if p[ADD_PARAMS] != ADD_RES {
         return None;
     }
     // SAFETY: a node of `finish_add_norm`, whose source 3 is the norm's weight.
@@ -444,12 +509,14 @@ pub(crate) fn norm_of(dst: &ffi::ggml_tensor) -> Option<(super::op::NormParams, 
 }
 
 /// A finish node's residual (the device address of its source 2, [`finish_add`]) and the
-/// column its sums go to (0 without a residual).
+/// column its sums go to (0 for a plain [`finish`]; a [`finish_cols`]' own, without a residual).
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) fn add_of(dst: &ffi::ggml_tensor) -> (Option<usize>, usize) {
     let p = external_params(dst);
-    if p[ADD_PARAMS] == 0 {
-        return (None, 0);
+    match p[ADD_PARAMS] {
+        ADD_RES => {}
+        ADD_COLS => return (None, p[ADD_PARAMS + 1] as usize),
+        _ => return (None, 0),
     }
     // SAFETY: a node of `finish_add`, whose source 2 is its residual.
     let res = unsafe { (*dst.src[2]).data as usize };

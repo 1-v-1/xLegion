@@ -288,7 +288,7 @@ fn read_rows_from(
 ) -> Vec<f32> {
     let width = t.ne()[0] as usize;
     let n = t.nbytes() / 4;
-    let skip = (from * width).min(n);
+    let skip = from.saturating_mul(width).min(n);
     if skip == 0 {
         return read_rows(bounce, small, spare, backend, t);
     }
@@ -2635,23 +2635,31 @@ impl Executor {
     /// GPUs' graphs start beside the next MTP pass instead (`commit_par`). Adapted from
     /// Strata-AC922's async commit on a layer split (eelgaev/Strata-AC922 d775be3, MIT).
     pub fn commit(&mut self, commits: &[(usize, usize)]) -> Result<(), ModelError> {
+        self.commit_with(commits, true)
+    }
+
+    /// [`Self::commit`] of `commits` whose mirror [`Self::mirror_commit`] already sent to the
+    /// other ranks.
+    pub fn commit_mirrored(&mut self, commits: &[(usize, usize)]) -> Result<(), ModelError> {
+        self.commit_with(commits, false)
+    }
+
+    /// [`Self::commit`], its mirror to the other ranks sent first if `mirror`.
+    fn commit_with(&mut self, commits: &[(usize, usize)], mirror: bool) -> Result<(), ModelError> {
         let model = &self.model;
         // Without recurrent layers a verify step has nothing to replay: the KV rows past the
         // kept tokens are simply never read again.
         if !model.hp.has_slot_state() {
             return Ok(());
         }
-        let wire = || crate::node::Request::TpCommit {
-            commits: commits
-                .iter()
-                .map(|&(slot, keep)| (slot as u32, keep as u32))
-                .collect(),
-        };
+        let wire = || tp_lead::commit_wire(commits);
         // Rank 1 of a split model commits its layers' states the same way (#560).
-        if let Some(r) = self.remote.as_mut() {
+        if mirror && let Some(r) = self.remote.as_mut() {
             r.mirror(wire());
         }
-        self.tp_mirror_states(wire);
+        if mirror {
+            self.tp_mirror_states(wire);
+        }
         // Not waited for: every stage's commit runs at once on its own device, and the next
         // step (or MTP pass) runs after it on the same stream. Anything that touches the states
         // another way waits first (`wait_commit`). Pending from the first launch on, so a later
@@ -2968,15 +2976,24 @@ impl Executor {
         self.applied.clear();
         if self.tp.is_some() {
             self.prompt_next = None;
-            self.hidden_from = 0;
-            // Only the MTP head's take-in leaves the rows on the device over machines (every
-            // rank alike, `tp_step`), where it may ([`Self::mtp_rows_device`]).
-            if self.hidden_dev_from.is_none() || self.mtp_rows_device().is_none() {
+            // A DFlash prompt step's first row read back goes to every rank (`tp_step`): each
+            // reads back the rows from it on, the ones its drafter (rank 0's, or a share of it
+            // with `--tp-draft-split`) takes in (#1133).
+            if !tp_lead::rows_from() {
+                self.hidden_from = 0;
+            }
+            // Over machines the rows stay on the device (every rank alike, `tp_step`) for the
+            // MTP head's take-in, where it may ([`Self::mtp_rows_device`]), and for the DFlash
+            // drafter's under `--tp-draft-split` (#1133).
+            if !self.tp_keeps_draft_rows()
+                && (self.hidden_dev_from.is_none() || self.mtp_rows_device().is_none())
+            {
                 self.hidden_on_device = None;
                 self.hidden_dev_from = None;
             }
             self.captures.clear();
             let out = self.tp_step(groups);
+            self.hidden_from = 0;
             self.hidden_on_device = None;
             self.hidden_dev_from = None;
             return out;
@@ -3073,6 +3090,8 @@ impl Executor {
     /// `row` on only: the rows before it keep their length in the output but hold anything (an
     /// earlier step's rows, or zeros). For a drafter that reads only a prompt chunk's last rows
     /// (DFlash's ring, #1133); a step of one micro-chunk applies it, others read every row.
+    /// Over machines rank 0 sends it with the step and every rank applies it (each one's
+    /// rows feed its drafter: rank 0's, or a share of it with `--tp-draft-split`).
     /// Only the next step reads it.
     pub fn set_hidden_from(&mut self, row: usize) {
         self.hidden_from = row;

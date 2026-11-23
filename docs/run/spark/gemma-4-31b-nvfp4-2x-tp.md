@@ -34,12 +34,14 @@ legion serve \
 # rank 1: the same without --port, with --tp-rank 1
 ```
 
-Deterministic client: the same 8 fixed prompts as the 1x row, temperature 0, 256 tokens each (2026-11-20, two
-sessions, 2 rounds each). 1 user 36.5 to 66.0 tok/s by prompt, median 46.6 over the 4 rounds, mean accepted length
-3.27-3.32, the same tokens in every round; 126.4 tok/s at 4 users (the median of 4 rounds, 120.7-129.1); 363.8 at
-16 users (the median of 4 rounds, 353.4-381.5). Prefill 8K 2,765 / 2,789 (mean 2,777) and 32K 2,496 / 2,500
-(2,498) tok/s, one request each per session after an 8K warm-up, from the same servers. 123K was not measured
-(heat, below).
+Deterministic client: the same 8 fixed prompts as the 1x row, temperature 0, 256 tokens each (2026-11-23, two
+sessions, 2 rounds each). 1 user 37.7 (story) to 68.1 (code) tok/s by prompt, median 47.4-47.9 per round, mean
+accepted length 3.26-3.30, the same tokens in every round; 135.8 tok/s at 4 users (the median of 4 rounds,
+130.0-138.7); 390.4 at 16 users (the median of 4 rounds, 384.6-395.7). Prefill 8K 2,988-2,994 (median 2,992) and
+32K 2,559-2,575 (2,568) tok/s, two requests each per session after an 8K warm-up, from the same servers. 123K was
+not measured (heat, below). The 2026-11-21 measurement, before half 0's attention output in two parts: prefill 8K
+2,776 and 32K 2,508, 1 user median 47.7-48.6, 136.5 at 4 users, 385.8 at 16 users. vLLM 0.33.0 TP2 (2026-11-20, [its command](../other-engines.md#gemma-4-31b)): 1 user
+35.0-59.7 (median 45.1), 124.2 at 4 users, 290.1 at 16 users, prefill 8K 2,381 and 32K 1,612.
 
 `--tp-draft-split` and `--spec-draft-weights q4` (2026-11-20): the drafter's FFN split over the two Sparks and its
 matrices in 4 bits instead of Q8_0 cut the time between verify steps (the draft pass and host work, on rank 0)
@@ -80,6 +82,12 @@ sessions in ABBA order (whole / halves / halves / whole): prefill 8K 2,274 / 2,6
 2,130 / 2,466 / 2,466 / 2,138 tok/s (each includes `--deterministic`'s 200 ms gather), a 32K prompt step on rank 0
 1,886 -> 1,634 ms. Decode does not change (1, 4 and 16 users within 1%), and the output is the same bits:
 the same text and log probabilities at 1, 4 and 16 users, at 8K depth and for 8K and 32K prompts.
+
+Since 2026-11-22, steps of 3,072 tokens or more also run half 0's attention output projection in two parts
+(1/3 and 2/3 of the half), so the first part's sum travels while the second part computes (no flag;
+`LEGION_DEBUG_GEMMA4_TP_PARTS=2` on both ranks gives the plain halves). The command above, two sessions in ABBA
+order: prefill 8K 2,937-2,952 -> 2,993-2,997 (+1.8%) and 32K 2,525-2,544 -> 2,560-2,575 (+1.4%); 1 user ties,
+and the 1-user text and the 8K and 32K prompts' log probabilities are the same bits.
 
 `--tp-draft-split` alone, 2026-11-19 (8-bit drafter), on both ranks: the DFlash drafter's FFN is split over the two Sparks like the target's,
 so rank 1 no longer waits while rank 0 drafts. The time between verify steps drops from about 19 / 25 / 33 ms to

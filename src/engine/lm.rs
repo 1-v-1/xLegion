@@ -29,11 +29,14 @@ mod adaptive;
 mod bandwidth;
 mod captures;
 mod chat_format;
+mod draft_defer;
+mod early_commit;
 mod even;
 mod first_rows;
 mod fit;
 mod host_tier;
 mod host_time;
+mod kv_fit;
 mod kv_vmm;
 mod layout;
 mod mtp_ngram;
@@ -1651,6 +1654,10 @@ pub struct LmEngine {
     chat_format: ChatFormat,
     grammars: Mutex<GrammarCache>,
     ctx_size: usize,
+    /// The KV pool's blocks and the drafts per verify step, as the worker's admission counts
+    /// them ([`kv_fit`]): a request that can never fit is refused before it queues.
+    kv_blocks: usize,
+    spec_k: usize,
     max_waiting: usize,
     /// Requests submitted and not yet admitted.
     queued: Arc<AtomicUsize>,
@@ -3633,6 +3640,8 @@ struct LoadFacts<'a> {
     engram: Option<report::NgramPlacement>,
     /// Saved prefix-cache states in pinned host memory, all stages.
     saved_host_bytes: u64,
+    /// Tensor parallelism over machines: the pinned exchange buffers made at load (#1133).
+    tp_buffer_bytes: u64,
 }
 
 /// Where a load put everything: the layout's stages and weight bytes, the KV pools and host
@@ -3708,15 +3717,15 @@ fn load_report(
         };
         if let Some(r) = exec.experts_mut() {
             let layers = r.layer_slots();
-            for &(il, slots, bytes) in &layers {
-                let s = &mut stages[layout.stage_of(il)];
-                s.expert_layers += 1;
-                s.expert_slots += slots;
-                s.expert_slot_bytes += bytes;
-            }
+            let stage_cuda: Vec<Option<usize>> = layout
+                .stages
+                .iter()
+                .map(|(d, _)| d.and_then(cuda_index))
+                .collect();
+            report::add_expert_slots(&mut stages, &stage_cuda, &layers, |il| layout.stage_of(il));
             summary.cached_layers = layers.len();
-            summary.slots_min = layers.iter().map(|l| l.1).min().unwrap_or(0);
-            summary.slots_max = layers.iter().map(|l| l.1).max().unwrap_or(0);
+            summary.slots_min = layers.iter().map(|l| l.2).min().unwrap_or(0);
+            summary.slots_max = layers.iter().map(|l| l.2).max().unwrap_or(0);
             // Staging VRAM by CUDA index; the stages run on CUDA0, CUDA1, ... in order.
             for (cuda, bytes) in r.stage_bytes() {
                 if let Some(s) = stages.get_mut(cuda) {
@@ -3782,6 +3791,7 @@ fn load_report(
         }
     }
     add_host(&mut host, None, HostUse::SavedStates, f.saved_host_bytes);
+    add_host(&mut host, None, HostUse::TpBuffers, f.tp_buffer_bytes);
     host.sort_by_key(|h| (h.node.is_none(), h.node, h.kind));
     let types = exec.kv_types();
     report::LoadReport {
@@ -5743,6 +5753,7 @@ impl LmEngine {
         }
         // Tensor parallelism over machines (#619): the ranks above 0 run rank 0's steps from
         // here on; rank 0 connects to them, and every rank keeps the fewest KV blocks.
+        let mut tp_buffer_bytes = 0u64;
         if let Some(start) = tp_start.take() {
             // `--tp-per-gpu`'s ranks keep host tiers of their own (#1131): each reads its own
             // blocks past the device's in its steps, as one GPU alone does.
@@ -5761,7 +5772,8 @@ impl LmEngine {
                     drafter,
                 ));
             }
-            let blocks = tp_node::lead(&mut exec, start, n_blocks)?;
+            let (blocks, presized) = tp_node::lead(&mut exec, start, n_blocks)?;
+            tp_buffer_bytes = presized.map_or(0, |p| p.bytes as u64);
             n_blocks = n_blocks.min(blocks);
             hbm_blocks = hbm_blocks.min(blocks);
         }
@@ -5814,6 +5826,7 @@ impl LmEngine {
                 ngram,
                 engram,
                 saved_host_bytes,
+                tp_buffer_bytes,
             },
         );
         log_memory_plan(
@@ -6047,6 +6060,7 @@ impl LmEngine {
             drafting,
             spec_k,
             spec_config: cfg.spec.clone(),
+            draft_deferred: Vec::new(),
             next_id: 0,
             long: long_prompts,
             micro,
@@ -6079,6 +6093,7 @@ impl LmEngine {
             outbox: stream::Outbox::new(tokenizer.clone(), cfg.stream_thread_seqs),
         };
         let live = worker.outbox.live();
+        let (kv_blocks, spec_k) = (worker.pool_blocks(), worker.spec_k);
         let worker = std::thread::Builder::new()
             .name("legion-qwen35".into())
             .spawn(move || {
@@ -6110,6 +6125,8 @@ impl LmEngine {
             chat_format,
             grammars: Mutex::new(GrammarCache::default()),
             ctx_size: cfg.ctx_size,
+            kv_blocks,
+            spec_k,
             max_waiting: cfg.max_waiting,
             queued: Arc::new(AtomicUsize::new(0)),
             live,
@@ -6234,6 +6251,15 @@ impl LmEngine {
                 context: self.ctx_size as u32,
             });
         }
+        // Nor one whose prompt and `max_tokens` need more KV cache than the pool holds: the
+        // worker's admission would refuse it after it queued (#125).
+        kv_fit::check(
+            prompt.len(),
+            req.max_tokens,
+            self.ctx_size,
+            self.spec_k,
+            self.kv_blocks,
+        )?;
         // The images through the vision tower, once the request is known to fit.
         let media = match &self.vision {
             Some(v) if !images.is_empty() => Some(v.encode(&prompt, images, || self.idle())?),
@@ -6435,6 +6461,9 @@ struct Worker {
     /// Max drafts per sequence and step (0: speculation off).
     spec_k: usize,
     spec_config: SpecConfig,
+    /// DFlash prompt chunks' take-in-only rounds left for the next round that runs at once
+    /// ([`draft_defer`], #1133), oldest first.
+    draft_deferred: Vec<draft_defer::Round>,
     /// Rings of the sliding-window layers no sequence holds (with rings; empty without).
     free_rings: Vec<usize>,
     /// KV sequence slots no sequence holds (with slots; empty without).
@@ -6936,16 +6965,16 @@ impl Worker {
         slot: usize,
     ) -> Admission<'t> {
         let len = job.prompt.len();
-        let max_len = (len + job.max_tokens as usize).min(self.max_ctx);
-        // A verify step writes up to k positions past the last one kept.
-        let need = (max_len + self.spec_k).div_ceil(KV_BLOCK);
-        if need > self.pool_blocks() {
-            let e = format!(
-                "the sequence needs {} KV cache tokens, the cache holds {}",
-                need * KV_BLOCK,
-                self.pool_blocks() * KV_BLOCK
-            );
-            return Admission::Failed(job, e);
+        // `LmEngine::prepare` refused a request this large already; this stays as the guard.
+        let need = kv_fit::blocks(len, job.max_tokens, self.max_ctx, self.spec_k);
+        if let Err(e) = kv_fit::check(
+            len,
+            job.max_tokens,
+            self.max_ctx,
+            self.spec_k,
+            self.pool_blocks(),
+        ) {
+            return Admission::Failed(job, e.to_string());
         }
         let take = self.admit_blocks(len, need);
         let Placed {
@@ -7467,6 +7496,8 @@ impl Worker {
         match &mut self.drafting {
             Drafting::Model(d) => {
                 d.release(seq.id);
+                // Its take-ins still waiting go with its state (#1133).
+                self.draft_deferred.retain_mut(|r| r.release(seq.id));
                 // The other ranks' shares of it (`--tp-draft-split`).
                 self.exec.tp_draft_release(seq.id);
             }
@@ -8542,6 +8573,30 @@ impl Worker {
         let keep_history = self.spec_k > 0 || self.warm_on || self.on_demand() || self.end_saves;
         // Whether a row's device argmax is the host argmax of its logits (#695).
         let exact = self.exec.model().hp.arch.argmax_first_of_ties();
+        // A verify step over machines (#1176): every sequence's drafts are verified before any
+        // of the step's text is made, so the other ranks get the commit as soon as its counts
+        // are known instead of after the detokenizer, the stream sends and the stop strings
+        // ([`early_commit`]). `early`: the pairs sent, which this rank then commits.
+        let mut verified_early = Vec::new();
+        let mut early = None;
+        if verify
+            && self.exec.early_commits()
+            && decoding.iter().all(|s| early_commit::plain(&s.active))
+        {
+            verified_early = (decoding.iter_mut())
+                .map(|seq| verify_drafts(seq, &mut rows, n_tok, exact, &self.stop_tokens))
+                .collect();
+            let stop = &self.stop_tokens[..];
+            let ends = (decoding.iter().zip(&verified_early))
+                .any(|(s, v)| early_commit::may_end(&s.active, s.n_past, &v.o.appended, stop));
+            if !ends {
+                let pairs = early_commit::pairs(base, &verified_early);
+                if self.exec.mirror_commit(&pairs) {
+                    early = Some(pairs);
+                }
+            }
+        }
+        let mut verified_early = verified_early.into_iter();
         for (i, seq) in decoding.iter_mut().enumerate() {
             let start = seq.n_past;
             let mut appended = Vec::new();
@@ -8570,24 +8625,10 @@ impl Worker {
                     self.trim(seq, seq.n_past);
                 }
             } else {
-                let drafts = std::mem::take(&mut seq.draft);
-                let a = &mut seq.active;
-                let mut mine: Vec<_> = rows.by_ref().take(n_tok).collect();
-                mine.truncate(1 + drafts.tokens.len());
-                let mut target = SeqTarget {
-                    keep_raw: a.logprobs.is_some(),
-                    device_picks: exact && a.logprobs.is_none() && a.sampler.is_greedy(),
-                    rows: mine,
-                    sampler: &mut a.sampler,
-                    raw: Vec::new(),
-                    mask_rows: a.min_tokens.saturating_sub(a.generated) as usize,
-                    stop_tokens: &self.stop_tokens,
+                let Verified { drafts, o, mut raw } = match verified_early.next() {
+                    Some(v) => v,
+                    None => verify_drafts(seq, &mut rows, n_tok, exact, &self.stop_tokens),
                 };
-                let (stop, ignore_eos) = (&self.stop_tokens, a.ignore_eos);
-                let o = accept::verify(&mut target, &drafts.tokens, &drafts.probs, |t| {
-                    !ignore_eos && stop.contains(&t)
-                });
-                let mut raw = target.raw;
                 // Drafts after an accepted end-of-generation token were never verified (the
                 // step ended on an accepted draft: no token was picked after it).
                 let verified = if o.appended.len() == o.accepted {
@@ -8643,9 +8684,16 @@ impl Worker {
             }
             if finished {
                 // A verify step left the state where the step started (finished sequences
-                // are not committed); a decode step advanced it.
+                // are not committed), unless its commit went out early; a decode step
+                // advanced it.
                 done.push(i);
-                done_at.push(if verify { start } else { seq.n_past });
+                let committed = early.is_some();
+                if committed {
+                    tracing::debug!(slot = base + i, "a sequence ended after its early commit");
+                }
+                done_at.push(early_commit::end_state(
+                    verify, committed, start, seq.n_past,
+                ));
             }
             sampled += appended.len() as u64 + u64::from(finished);
             ran.push((start, appended.len()));
@@ -8744,7 +8792,16 @@ impl Worker {
             // Before any slot moves: the verify group's states are those of slots `base..`.
             self.clock.lap(host_time::Phase::Finish, &mut at);
             let t = Instant::now();
-            self.exec.commit(&commits).map_err(|e| e.to_string())?;
+            match &early {
+                // The pairs the other ranks commit: every slot of the group, a sequence that
+                // ended after all included (its end save skipped, [`early_commit::end_state`]).
+                Some(sent) => {
+                    debug_assert!(early_commit::covers(sent, &commits));
+                    self.exec.commit_mirrored(sent)
+                }
+                None => self.exec.commit(&commits),
+            }
+            .map_err(|e| e.to_string())?;
             let commit_ms = t.elapsed().as_secs_f64() * 1e3;
             self.clock.lap(host_time::Phase::Device, &mut at);
             tracing::debug!(
@@ -8861,6 +8918,11 @@ impl Worker {
             let defer = matches!(self.drafting, Drafting::Mtp(_))
                 && !self.exec.mtp_shares_kv()
                 && !self.exec.has_remote();
+            // A DFlash round of prompt chunks alone may wait for the next round
+            // ([`draft_defer`], #1133); not with sequences decoding, whose take-ins are short.
+            let dflash_waits = self.spec_config.kind == crate::spec::SpecKind::Dflash
+                && self.spec_config.model_drafter.is_none()
+                && (0..decoding.len()).all(|i| done.contains(&i));
             let mut off = decoding.len() * n_tok;
             let ngram_step = mtp_ngram::NgramStep {
                 depth: self.depth.as_ref(),
@@ -8965,7 +9027,7 @@ impl Worker {
                 self.clock.lap(host_time::Phase::Finish, &mut at);
                 match &mut self.drafting {
                     Drafting::Model(d) => {
-                        let t = Instant::now();
+                        let mut t = Instant::now();
                         // `--tp-draft-split`: every rank runs the round, its share of the FFN. A
                         // round that fails on any rank still runs all its sums there (zeros), so
                         // the others' ends and the communicator stays usable (`DflashDrafter`'s
@@ -8986,21 +9048,69 @@ impl Worker {
                                 .collect()
                         };
                         self.exec.tp_draft(wire).map_err(|e| e.to_string())?;
-                        if hidden_dev.is_empty() {
-                            d.step(&mut batch)?;
+                        // A DFlash round of prompt chunks' take-ins only waits for the next
+                        // round, which runs it first (#1133): after the prompt's first token.
+                        let wait = dflash_waits
+                            && self.draft_deferred.len() < draft_defer::MAX_ROUNDS
+                            && draft_defer::defers(
+                                draft_defer::on(),
+                                !hidden_dev.is_empty(),
+                                batch.iter().map(|r| r.max),
+                                (batch.iter()).map(|r| {
+                                    (d.rows_read_from(r.tokens.len(), r.start, r.ran), r.ran)
+                                }),
+                            );
+                        if wait {
+                            let reqs = (batch.iter().zip(&offs))
+                                .map(|(r, &off)| draft_defer::Req {
+                                    seq: r.seq,
+                                    tokens: r.tokens.to_vec(),
+                                    start: r.start,
+                                    ran: r.ran,
+                                    off,
+                                })
+                                .collect();
+                            let round = draft_defer::Round::new(hidden.clone(), n_step, reqs);
+                            self.draft_deferred.push(round);
                         } else {
-                            let rows = DeviceHidden {
-                                layers: &hidden_dev,
-                                first: &offs,
+                            // The rounds left before, in their order and ahead of this one:
+                            // every rank runs a sequence's take-ins in the order it would have.
+                            // One that fails still lets this round run, whose sums (with
+                            // `--tp-draft-split`) the other ranks wait for.
+                            let waited = !self.draft_deferred.is_empty();
+                            let mut left = Ok(());
+                            for round in std::mem::take(&mut self.draft_deferred) {
+                                let t0 = Instant::now();
+                                let (r, rows) = round.run(d.as_mut());
+                                left = left.and(r);
+                                // No DFlash pass names a step's rows later: they go back now.
+                                if let Some(rows) = rows {
+                                    self.exec.recycle_rows(rows);
+                                }
+                                let ms = t0.elapsed().as_secs_f64() * 1e3;
+                                tracing::debug!(ms, "dflash deferred take-in");
+                            }
+                            if waited {
+                                t = Instant::now();
+                            }
+                            let ran = if hidden_dev.is_empty() {
+                                d.step(&mut batch)
+                            } else {
+                                let rows = DeviceHidden {
+                                    layers: &hidden_dev,
+                                    first: &offs,
+                                };
+                                d.step_device(&mut batch, &rows)
                             };
-                            d.step_device(&mut batch, &rows)?;
-                        }
-                        let ms = t.elapsed().as_secs_f64() * 1e3;
-                        tracing::debug!(ms, seqs = batch.len(), "model drafts");
-                        // A block drafter's pass, timed without a prompt's take-in.
-                        if let (Some(depth), true) = (&mut self.depth, chunks.is_empty()) {
-                            depth.set_context(draft_span);
-                            depth.record_passes(batch.len(), 1, ms);
+                            left?;
+                            ran?;
+                            let ms = t.elapsed().as_secs_f64() * 1e3;
+                            tracing::debug!(ms, seqs = batch.len(), "model drafts");
+                            // A block drafter's pass, timed without a prompt's take-in.
+                            if let (Some(depth), true) = (&mut self.depth, chunks.is_empty()) {
+                                depth.set_context(draft_span);
+                                depth.record_passes(batch.len(), 1, ms);
+                            }
                         }
                     }
                     Drafting::Mtp(d) => {
@@ -9059,7 +9169,9 @@ impl Worker {
         for (&i, &state_at) in done.iter().zip(&done_at).rev() {
             let mut seq = decoding.swap_remove(i);
             self.log_done(&seq);
-            self.save_end(&seq, state_at, &mut copies);
+            if let Some(state_at) = state_at {
+                self.save_end(&seq, state_at, &mut copies);
+            }
             self.release(&mut seq);
             if i < decoding.len() {
                 copies.push((Pool::Seq, base + decoding.len(), Pool::Seq, base + i));
@@ -9303,6 +9415,45 @@ fn verify_logits(kind: Logits, n: usize, generated: u32, min_tokens: u32) -> Log
     }
 }
 
+/// A sequence's drafts verified against its rows of a verify step ([`verify_drafts`]).
+struct Verified {
+    drafts: Draft,
+    o: accept::Outcome,
+    /// Per appended token, its row's raw logits when kept (log probabilities).
+    raw: Vec<Option<Vec<f32>>>,
+}
+
+/// Verifies `seq`'s drafts (taken from it) against its `n_tok` rows of a verify step, the next
+/// of `rows` ([`accept::verify`]). Touches nothing but `seq`'s drafts and sampler, so the
+/// sequences of a step may be verified before any of them advances.
+fn verify_drafts(
+    seq: &mut Seq<'_>,
+    rows: &mut impl Iterator<Item = (u32, Vec<f32>)>,
+    n_tok: usize,
+    exact: bool,
+    stop_tokens: &[u32],
+) -> Verified {
+    let drafts = std::mem::take(&mut seq.draft);
+    let a = &mut seq.active;
+    let mut mine: Vec<_> = rows.by_ref().take(n_tok).collect();
+    mine.truncate(1 + drafts.tokens.len());
+    let mut target = SeqTarget {
+        keep_raw: a.logprobs.is_some(),
+        device_picks: exact && a.logprobs.is_none() && a.sampler.is_greedy(),
+        rows: mine,
+        sampler: &mut a.sampler,
+        raw: Vec::new(),
+        mask_rows: a.min_tokens.saturating_sub(a.generated) as usize,
+        stop_tokens,
+    };
+    let ignore_eos = a.ignore_eos;
+    let o = accept::verify(&mut target, &drafts.tokens, &drafts.probs, |t| {
+        !ignore_eos && stop_tokens.contains(&t)
+    });
+    let raw = target.raw;
+    Verified { drafts, o, raw }
+}
+
 /// One sequence being generated: everything but the model state.
 struct Active<'t> {
     sampler: Sampler,
@@ -9533,8 +9684,9 @@ impl<'t> Active<'t> {
             self.finish(outbox, FinishReason::StopSequence, Some(stop));
             return None;
         }
-        // The fed-back token needs a cache slot: stop when the context is full.
-        if self.generated >= self.max_tokens || n_past >= self.max_ctx {
+        // The fed-back token needs a cache slot: stop when the context is full. The same test
+        // as a verify step's early commit makes ([`early_commit::may_end`]).
+        if early_commit::at_limit(self.generated, self.max_tokens, n_past, self.max_ctx) {
             self.end(outbox, FinishReason::Length, false);
             return None;
         }
