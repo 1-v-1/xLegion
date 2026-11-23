@@ -685,7 +685,17 @@ fn hf_options(cfg: &LmConfig) -> crate::hf::OpenOptions {
     crate::hf::OpenOptions {
         fp8: cfg.hf_fp8,
         mtp_nvfp4: split && drafts_with_mtp_head(&cfg.spec) && !bf16,
+        dense_fp8: cfg.dense_fp8,
     }
+}
+
+/// `--dense-fp8` runs on one machine and one device per layer: tensor parallelism (over GPUs
+/// or machines) would cut the copies' rows from their per-row scales.
+fn check_dense_fp8(cfg: &LmConfig) -> Result<(), String> {
+    if cfg.dense_fp8 && (cfg.tp > 1 || cfg.tp_net.is_some()) {
+        return Err("--dense-fp8 does not run under tensor parallelism yet (--tp)".into());
+    }
+    Ok(())
 }
 
 /// Whether the depth policy may draft for a group of decoding sequences that leaves the
@@ -1155,6 +1165,12 @@ pub struct LmConfig {
     pub fp16: crate::weights::Fp16Load,
     /// Which NVFP4 matmuls take 4-bit activations (W4A4 kernels).
     pub nvfp4_a4: crate::model::core::Nvfp4A4,
+    /// `--dense-fp8`: FP8 copies of a Qwen3.8-Flash-Next checkpoint's BF16 dense projections,
+    /// made at load, for decode and verify steps ([`crate::hf::dense_fp8`]).
+    pub dense_fp8: bool,
+    /// `--dense-fp8-prompt`: prompt steps read those copies too, as W8A8 GEMMs
+    /// ([`crate::model::core::Model::set_dense_fp8_prompt`]).
+    pub dense_fp8_prompt: bool,
     /// Where the routed experts live and the VRAM expert cache (see [`crate::residency`]).
     pub residency: crate::residency::ResidencyConfig,
     /// GPUs to split the layers over (CUDA0, CUDA1, ...; one pipeline stage each).
@@ -1572,6 +1588,8 @@ impl LmConfig {
             nvfp4_mm: crate::model::core::Nvfp4Mm::Auto,
             fp16: Default::default(),
             nvfp4_a4: crate::model::core::Nvfp4A4::Off,
+            dense_fp8: false,
+            dense_fp8_prompt: false,
             residency: Default::default(),
             gpus: 1,
             tp: 1,
@@ -3956,6 +3974,7 @@ impl LmEngine {
         cfg.switches.apply();
         node::check_config(&cfg)?;
         tp_node::check_config(&cfg)?;
+        check_dense_fp8(&cfg).map_err(LoadError::Device)?;
         slo::check(cfg.slo, cfg.pipeline_groups, cfg.node.is_some()).map_err(LoadError::Device)?;
         crate::model::core::paged::set_m884_prefill(cfg.paged_prefill_m884);
         crate::model::qwen4::qsa_attn::set_ggml_paths(cfg.qsa_scores_ggml, cfg.qsa_topk_ggml);
@@ -4278,6 +4297,14 @@ impl LmEngine {
         };
         model.keep_a8(cfg.nvfp4_act == crate::model::core::Nvfp4Act::A8);
         model.set_fp8_act(cfg.fp8_act);
+        if model.set_dense_fp8_prompt(cfg.dense_fp8_prompt) {
+            tracing::info!("--dense-fp8-prompt: prompt steps read the FP8 copies as W8A8 GEMMs");
+        } else if cfg.dense_fp8_prompt {
+            tracing::warn!(
+                "--dense-fp8-prompt ignored: no FP8 copies in the model (--dense-fp8) or no FP8 \
+                 tensor cores on this GPU"
+            );
+        }
         model.set_nvfp4_mm(cfg.nvfp4_mm);
         model.set_nvfp4_a4(cfg.nvfp4_a4);
         #[cfg(feature = "cuda")]
