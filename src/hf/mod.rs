@@ -17,6 +17,7 @@
 //! on synthetic checkpoints, and the real-model test compares a converted GGUF byte for byte.
 
 mod deepseek41;
+pub mod dense_fp8;
 mod gemma4;
 mod glm5next;
 mod nemotron_h;
@@ -59,6 +60,9 @@ pub struct OpenOptions {
     /// over tensor-parallel ranks that each hold the head's share.
     /// Only the drafter reads them, so the target's tokens under greedy verify do not change.
     pub mtp_nvfp4: bool,
+    /// `--dense-fp8`: a `qwen4_exp` checkpoint's BF16 dense projections get FP8 copies made
+    /// at load, for decode-sized steps ([`dense_fp8`]). Other architectures ignore it.
+    pub dense_fp8: bool,
 }
 
 /// Opens the checkpoint in `dir` as a synthetic GGUF model.
@@ -80,6 +84,8 @@ pub(crate) fn open(dir: &Path, opts: &OpenOptions) -> Result<GgufFile, GgufError
     let mut b = Builder::new(Arc::new(ckpt));
     b.modelopt = nvfp4::ModelOpt::detect(&b.ckpt, &config, opts.fp8).map_err(err)?;
     b.mtp_nvfp4 = opts.mtp_nvfp4;
+    b.dense_fp8_on =
+        opts.dense_fp8 && matches!(model_type.as_str(), "qwen4_exp" | "qwen4_exp_text");
     match model_type.as_str() {
         "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => {
             qwen35::build(&mut b, &config).map_err(err)?
@@ -127,6 +133,9 @@ pub fn open_mtp(dir: &Path, opts: &OpenOptions) -> Result<GgufFile, GgufError> {
         .to_string();
     let mut b = Builder::new(Arc::new(ckpt));
     b.modelopt = nvfp4::ModelOpt::detect(&b.ckpt, &config, opts.fp8).map_err(err)?;
+    // Never `--dense-fp8` copies: the drafter reads the head's BF16 weights
+    // ([`dense_fp8::takes_trunk`]).
+    b.dense_fp8_on = false;
     match model_type.as_str() {
         "qwen4_exp" | "qwen4_exp_text" => qwen4::build_mtp(&mut b, &config).map_err(err)?,
         other => {
@@ -150,6 +159,16 @@ pub(crate) struct Builder {
     stacks: HashMap<String, Arc<crate::gguf::Nvfp4Stack>>,
     /// [`OpenOptions::mtp_nvfp4`].
     mtp_nvfp4: bool,
+    /// [`OpenOptions::dense_fp8`], for this checkpoint's architecture.
+    dense_fp8_on: bool,
+    /// `--dense-fp8`: the model's own layers (which get copies) and its MTP layers (which do
+    /// not, [`dense_fp8::takes_trunk`]), set by the architecture's build.
+    dense_fp8_layers: Option<(u64, u64)>,
+    /// Projections [`dense_fp8`] gave no copy for not being of the model's own layers.
+    dense_fp8_skipped: usize,
+    /// The weights [`dense_fp8`] made FP8 copies of, with each copy's shape (pushed last, by
+    /// [`Self::finish`], so the weights keep their order in memory).
+    dense_fp8_names: Vec<(String, Vec<u64>)>,
 }
 
 /// The ggml type that holds a safetensors dtype unchanged.
@@ -172,6 +191,10 @@ impl Builder {
             modelopt: None,
             stacks: HashMap::new(),
             mtp_nvfp4: false,
+            dense_fp8_on: false,
+            dense_fp8_layers: None,
+            dense_fp8_skipped: 0,
+            dense_fp8_names: Vec::new(),
         }
     }
 
@@ -225,6 +248,7 @@ impl Builder {
         if let Some(r) = self.quantized(name, src, None, None, shape.clone()) {
             return r;
         }
+        self.dense_fp8(name, src, None, None, shape.as_deref())?;
         let (file, t) = self.source(src)?;
         let ty = ggml_type(&t.dtype)
             .ok_or_else(|| format!("`{src}`: dtype {} is not loadable as is", t.dtype.name()))?;
@@ -253,6 +277,7 @@ impl Builder {
         if let Some(r) = self.quantized(name, src, Some(rows), None, Some(shape.clone())) {
             return r;
         }
+        self.dense_fp8(name, src, Some(rows), None, Some(&shape))?;
         let (file, t) = self.source(src)?;
         let ty = ggml_type(&t.dtype)
             .ok_or_else(|| format!("`{src}`: dtype {} is not loadable as is", t.dtype.name()))?;
@@ -360,9 +385,16 @@ impl Builder {
     ) -> Result<(), String> {
         let f = Arc::new(f);
         let transform: nvfp4::Transform = f.clone();
-        if let Some(r) = self.quantized(name, src, None, Some(transform), Some(shape.clone())) {
+        if let Some(r) = self.quantized(
+            name,
+            src,
+            None,
+            Some(transform.clone()),
+            Some(shape.clone()),
+        ) {
             return r;
         }
+        self.dense_fp8(name, src, None, Some(transform), Some(&shape))?;
         let (_, t) = self.source(src)?;
         let ty = ggml_type(&t.dtype)
             .ok_or_else(|| format!("`{src}`: dtype {} is not loadable as is", t.dtype.name()))?;
@@ -379,12 +411,45 @@ impl Builder {
     }
 
     fn finish(mut self, path: PathBuf) -> Result<GgufFile, GgufError> {
-        for (k, v) in self
+        let mut kv = self
             .modelopt
             .as_ref()
             .map(nvfp4::ModelOpt::metadata)
-            .unwrap_or_default()
-        {
+            .unwrap_or_default();
+        // `--dense-fp8`'s copies, after every other tensor, and the weights they copy.
+        if !self.dense_fp8_names.is_empty() {
+            let (trunk, mtp) = self.dense_fp8_layers.unwrap_or_default();
+            let mtp = match (mtp, self.dense_fp8_skipped) {
+                (0, 0) => String::new(),
+                (0, s) => format!("; {s} skipped"),
+                (1, _) => format!("; the MTP layer (blk.{trunk}) skipped, the drafter reads BF16"),
+                (m, _) => format!(
+                    "; the {m} MTP layers (blk.{trunk}-{}) skipped, the drafter reads BF16",
+                    trunk + m - 1
+                ),
+            };
+            tracing::info!(
+                "--dense-fp8: {} dense projections of {trunk} layers get FP8 E4M3 copies (one \
+                 scale per row) for decode-sized steps{mtp}",
+                self.dense_fp8_names.len()
+            );
+            let mut names = Vec::new();
+            // A run's codes back to back, then its scales (`dense_fp8::RUNS`): one matrix and
+            // one scale vector for `--dense-fp8-prompt`'s joined GEMMs.
+            for group in dense_fp8::store_groups(std::mem::take(&mut self.dense_fp8_names)) {
+                for (name, shape) in &group {
+                    let (codes, _) = dense_fp8::copy_names(name);
+                    self.push(&codes, types::I8, shape.clone(), 0, 0);
+                }
+                for (name, shape) in group {
+                    let (_, scale) = dense_fp8::copy_names(&name);
+                    self.push(&scale, types::F32, vec![shape[1]], 0, 0);
+                    names.push(Value::String(name));
+                }
+            }
+            kv.push((dense_fp8::KEY, Value::Array(names)));
+        }
+        for (k, v) in kv {
             self.meta.set(k, &v)?;
         }
         let files = self
