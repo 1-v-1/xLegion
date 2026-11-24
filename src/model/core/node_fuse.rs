@@ -56,6 +56,8 @@ type Node = *mut ffi::ggml_tensor;
 /// `params[3]` [`FMA_SKIP`] (only under `--tp-moe-ep`) a row whose router weight is zero is not
 /// read, its term made from a zero: the same value where that row holds +0.0, as the rows of
 /// the experts another rank holds there; otherwise every row is read, as ggml-cuda reads them.
+/// In that form `src[0]` may be BF16 rows (`fold`'s `fuse_tail`, #1183): each value widened to
+/// F32 as ggml's copy to F32 widens it (exactly), the same sum as of that copy.
 /// `params[3]` of a [`MOE_SUM_GATE`] in its fused-sum form that skips the rows of zero router
 /// weights (`1` reads them all).
 pub(crate) const FMA_SKIP: i32 = 2;
@@ -116,12 +118,20 @@ pub(crate) struct Counts {
     pub gather_mix: usize,
     /// F32 copies of a BF16 all-gather's output written by the gather (#1176).
     pub gather_cast: usize,
+    /// Producers writing an FP8 GEMM's activation codes themselves (`--dense-fp8-prompt`,
+    /// #1183): the prompt attention ops that gate and quantize their output
+    /// ([`crate::model::qwen4::qsa_attn::gated_codes`]). Counted, not rewritten.
+    pub fp8_codes: usize,
     /// Nodes turned into `GGML_OP_NONE`.
     pub none: usize,
 }
 
 /// Graphs whose rewrite was logged (the first few only).
 static LOGGED: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether a graph with [`Counts::fp8_codes`] was logged (the first one is, after the first
+/// few graphs too: prompt steps may come later).
+static CODES_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// The pass on CUDA graphs ([`crate::ggml::post_alloc::set_rewrite`]). Then the CPU share's
 /// layers get their shared expert moved to run while the pool works
@@ -152,7 +162,8 @@ unsafe fn fuse(graph: *mut ffi::ggml_cgraph) {
     }
     // SAFETY: the caller's.
     let c = unsafe { rewrite_graph(graph, true) };
-    if c != Counts::default() && LOGGED.fetch_add(1, Ordering::Relaxed) < 4 {
+    let first_codes = c.fp8_codes > 0 && !CODES_LOGGED.swap(true, Ordering::Relaxed);
+    if c != Counts::default() && (LOGGED.fetch_add(1, Ordering::Relaxed) < 4 || first_codes) {
         tracing::info!(
             sum_gate = c.sum_gate,
             weighted_gate = c.weighted_gate,
@@ -163,6 +174,7 @@ unsafe fn fuse(graph: *mut ffi::ggml_cgraph) {
             mix_f32_skipped = c.mix_f32_skipped,
             gather_mix = c.gather_mix,
             gather_cast = c.gather_cast,
+            fp8_codes = c.fp8_codes,
             none = c.none,
             "node fuse: small ggml chains as Legion ops (the first graphs; --node-fuse-ggml off)"
         );
@@ -189,6 +201,9 @@ pub(crate) unsafe fn rewrite_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> 
                 ffi::ggml_op_GGML_OP_MUL => g.moe(i, cuda, &mut c),
                 ffi::ggml_op_GGML_OP_GET_ROWS => g.remap(i, &mut c),
                 ffi::ggml_op_GGML_OP_CUSTOM => {
+                    if crate::model::qwen4::qsa_attn::is_gated_codes(g.nodes[i]) {
+                        c.fp8_codes += 1;
+                    }
                     g.mix_cast(i, &mut c);
                     if cuda {
                         g.gather(i, &mut c);
@@ -1056,7 +1071,17 @@ unsafe fn cpu_moe_sum_gate(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
         let at = 1 + usize::from(weights != 0);
         let gate = (gated != 0).then(|| (&*dst.src[at], &*dst.src[at + 1]));
         let (e, n, k) = (dst.ne[0] as usize, dst.ne[1] as usize, k as usize);
-        let (xp, out) = (x.data as *const f32, dst.data as *mut f32);
+        let out = dst.data as *mut f32;
+        // F32 rows, or BF16 rows widened exactly (`fold`'s `fuse_tail`, #1183), as ggml's copy
+        // to F32 widens them.
+        let x16 = x.type_ == ffi::ggml_type_GGML_TYPE_BF16;
+        let xv = |i: usize| {
+            if x16 {
+                f32::from_bits(u32::from(*(x.data as *const u16).add(i)) << 16)
+            } else {
+                *(x.data as *const f32).add(i)
+            }
+        };
         for t in (ith..n).step_by(nth) {
             let s = gate.map(|(_, g)| {
                 let gv = *((g.data as *const u8).add(t * g.nb[1]) as *const f32);
@@ -1065,7 +1090,7 @@ unsafe fn cpu_moe_sum_gate(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
             for col in 0..e {
                 let weight = |j: usize| w.map(|w| *(w.data as *const f32).add(t * k + j));
                 let term = |j: usize| {
-                    let v = *xp.add((t * k + j) * e + col);
+                    let v = xv((t * k + j) * e + col);
                     match weight(j) {
                         Some(wj) => v * wj,
                         None => v,
@@ -1079,7 +1104,7 @@ unsafe fn cpu_moe_sum_gate(dst: &ffi::ggml_tensor, ith: usize, nth: usize) {
                         if fma == FMA_SKIP && wj(j) == 0.0 {
                             0.0
                         } else {
-                            *xp.add((t * k + j) * e + col)
+                            xv((t * k + j) * e + col)
                         }
                     };
                     (1..k).fold(row(0) * wj(0), |acc, j| row(j).mul_add(wj(j), acc))
@@ -1125,6 +1150,7 @@ struct SumGate {
     n_tok: i32,
     skip_zero: i32,
     out16: *mut u16,
+    x16: *const u16,
 }
 
 /// `legion_ids_remap` (src/cuda/node_fuse.cu).
@@ -1157,6 +1183,8 @@ unsafe extern "C" {
     static legion_moe_sum_gate_kernel: *const c_void;
     static legion_moe_tail_fma_kernel: *const c_void;
     static legion_moe_tail_fma4_kernel: *const c_void;
+    static legion_moe_tail_fma_x16_kernel: *const c_void;
+    static legion_moe_tail_fma4_x16_kernel: *const c_void;
     static legion_ids_remap_kernel: *const c_void;
     fn cudaLaunchKernel(
         func: *const c_void,
@@ -1238,12 +1266,21 @@ unsafe fn launch_sum_gate(
         if fma != 0 && (w.is_none() || gate.is_none()) {
             return Err("moe_sum_gate: the fused sum needs the weights and the gate".into());
         }
+        // BF16 experts' rows (`fold`'s `fuse_tail`, #1183): the fused sum's kernel only.
+        let x16 = x.type_ == ffi::ggml_type_GGML_TYPE_BF16;
+        if x16 && fma == 0 {
+            return Err("moe_sum_gate: BF16 rows in the fused sum only".into());
+        }
         // Token `t0`'s place in each tensor (the kernels index them by token).
         let g_ld = gate.map_or(0, |(_, g)| g.nb[1] / 4);
         let (ke, e_us) = (k as usize * e as usize, e as usize);
         let out16 = out16.map(|a| a + (t0 * e_us * 2) as u64);
         let mut p = SumGate {
-            x: (x.data as *const f32).add(t0 * ke),
+            x: if x16 {
+                std::ptr::null()
+            } else {
+                (x.data as *const f32).add(t0 * ke)
+            },
             w: w.map_or(std::ptr::null(), |w| {
                 (w.data as *const f32).add(t0 * k as usize)
             }),
@@ -1260,6 +1297,11 @@ unsafe fn launch_sum_gate(
             n_tok: n as i32,
             skip_zero: i32::from(fma == FMA_SKIP),
             out16: out16.map_or(std::ptr::null_mut(), |a| a as *mut u16),
+            x16: if x16 {
+                (x.data as *const u16).add(t0 * ke)
+            } else {
+                std::ptr::null()
+            },
         };
         // The fused sum's kernel: 4 columns a thread where every row is 16-byte aligned (the
         // BF16 values' rows 8-byte aligned).
@@ -1268,11 +1310,18 @@ unsafe fn launch_sum_gate(
             Some(a) => a.is_multiple_of(8),
             None => aligned(p.out.cast_const()),
         };
-        let v4 = fma != 0 && e % 4 == 0 && aligned(p.x) && aligned(p.sh) && out_aligned;
-        let (kernel, cols) = match (fma != 0, v4) {
-            (false, _) => (legion_moe_sum_gate_kernel, 1),
-            (true, false) => (legion_moe_tail_fma_kernel, 1),
-            (true, true) => (legion_moe_tail_fma4_kernel, 4),
+        let x_aligned = if x16 {
+            (p.x16 as usize).is_multiple_of(8)
+        } else {
+            aligned(p.x)
+        };
+        let v4 = fma != 0 && e % 4 == 0 && x_aligned && aligned(p.sh) && out_aligned;
+        let (kernel, cols) = match (fma != 0, v4, x16) {
+            (false, _, _) => (legion_moe_sum_gate_kernel, 1),
+            (true, false, false) => (legion_moe_tail_fma_kernel, 1),
+            (true, true, false) => (legion_moe_tail_fma4_kernel, 4),
+            (true, false, true) => (legion_moe_tail_fma_x16_kernel, 1),
+            (true, true, true) => (legion_moe_tail_fma4_x16_kernel, 4),
         };
         let grid = Dim3 {
             x: n as u32,

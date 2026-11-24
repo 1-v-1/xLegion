@@ -1657,7 +1657,7 @@ impl Model {
             ssd: None,
             host_tier: None,
             joined: Default::default(),
-            dense_twins: dense_twins::DenseTwins::from_gguf(gguf),
+            dense_twins: dense_twins::DenseTwins::from_gguf(gguf, |n| weights.get(n).is_some()),
             dense_runs: Default::default(),
             router_bf16: Default::default(),
             host_pins: None,
@@ -1711,7 +1711,7 @@ impl Model {
             ssd: None,
             host_tier: None,
             joined: Default::default(),
-            dense_twins: dense_twins::DenseTwins::from_gguf(gguf),
+            dense_twins: dense_twins::DenseTwins::from_gguf(gguf, |n| weights.get(n).is_some()),
             dense_runs: Default::default(),
             router_bf16: Default::default(),
             host_pins: None,
@@ -2096,6 +2096,13 @@ impl Model {
     pub fn set_dense_fp8_prompt(&mut self, on: bool) -> bool {
         self.dense_twins
             .set_prompt(on && crate::model::fp8::fp8_mma())
+    }
+
+    /// Which steps read the dense projections' FP8 copies (`--dense-fp8`, [`dense_twins`]): 0
+    /// none, 1 decode and verify steps, 3 prompt steps too. The ranks of tensor parallelism
+    /// over machines check that they agree (#1183).
+    pub fn dense_fp8_mode(&self) -> u32 {
+        self.dense_twins.mode()
     }
 
     /// Which kernels run NVFP4 matmuls on CUDA ([`Nvfp4Mm`]); graphs built after this call use
@@ -4185,13 +4192,17 @@ impl Model {
             ctx.set_shared_cast(o, types::BF16, ob);
         }
         // `--fp8-act a8-dynamic` prefill: its per-token FP8 codes from one op too; with
-        // `--dense-fp8-prompt` (#1183), MoE models' too.
-        if !tap.on
-            && ((!hp.moe && self.linear.dynamic_batch(n))
-                || self.twin_prompt_reads(il, "attn_output.weight", o))
-            && fp8_act::gate_fits(gate_view, o_pre)
-        {
-            fp8_act::share(ctx, o, fp8_act::gate(ctx, gate_view, o_pre, false));
+        // `--dense-fp8-prompt` (#1183), MoE models' too, and there from the sparse attention
+        // op itself where `o` is its output (the same codes, the output not written).
+        if !tap.on && fp8_act::gate_fits(gate_view, o_pre) {
+            let twin = self.twin_prompt_reads(il, "attn_output.weight", o);
+            if (!hp.moe && self.linear.dynamic_batch(n)) || twin {
+                let q = twin
+                    .then(|| crate::model::qwen4::qsa_attn::gated_codes(ctx, o_pre, gate_view))
+                    .flatten()
+                    .unwrap_or_else(|| fp8_act::gate(ctx, gate_view, o_pre, false));
+                fp8_act::share(ctx, o, q);
+            }
         }
         let out = self.lmm_add(ctx, il, "attn_output.weight", o, res)?;
         tap.tap("attn_output", il, out);
