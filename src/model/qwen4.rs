@@ -51,9 +51,12 @@ pub use hc_up_mix::{
     set_gpu as set_up_mix_gpu, set_rebuild as set_up_mix_rebuild, set_up_mix, set_up_mix_bf16,
 };
 mod mtp;
+pub(crate) mod mtp_in;
 mod ple_ahead;
 pub(crate) use ple_ahead::PleAhead;
 mod ple_fused;
+pub(crate) use ple_fused::is_ple_conv;
+pub(crate) use ple_fused::rewrite as ple_rewrite;
 pub use ple_fused::set_fused_ple;
 mod ple_late;
 pub(crate) use ple_late::LateRows;
@@ -69,7 +72,7 @@ pub mod tiny;
 mod tp_overlap;
 
 use std::ops::Range;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::ggml::{Context, Graph, Tensor, types};
 use crate::gguf::GgufFile;
@@ -669,8 +672,34 @@ fn ple_conv_time_major<'a>(
 }
 
 /// Tap `k` of the per-layer embedding's depthwise conv weight `w` as an F32 row of `width`.
+/// Whether [`Model::ple_ops`] said why it does not take a prompt step (once per process).
+static PLE_OPS_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Whether the MTP head said why its prompt take-ins keep ggml's input chain
+/// ([`mtp_in`]; once per process).
+static MTP_IN_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Logs once (per `flag`) that `what` is off for prompt steps, and `why`.
+fn off_once(flag: &AtomicBool, what: &str, why: &str) {
+    if !flag.swap(true, Ordering::Relaxed) {
+        tracing::info!("{what} off for prompt steps, ggml's chain instead: {why}");
+    }
+}
+
 fn ple_conv_tap<'a>(ctx: &'a Context, w: Tensor<'a>, k: i64, width: i64) -> Tensor<'a> {
+    ple_conv_tap_named(ctx, w, k, width, None)
+}
+
+/// [`ple_conv_tap`], its view of `w` named `name`.
+fn ple_conv_tap_named<'a>(
+    ctx: &'a Context,
+    w: Tensor<'a>,
+    k: i64,
+    width: i64,
+    name: Option<&str>,
+) -> Tensor<'a> {
     let wk = ctx.view_2d(w, [1, width], w.nb()[1], k as usize * w.nb()[0]);
+    let wk = name.map_or(wk, |name| wk.named(name));
     let wk = ctx.cont_2d(wk, width, 1);
     if wk.ty() != types::F32 {
         ctx.cast(wk, types::F32)
@@ -686,7 +715,8 @@ fn ple_conv_tap<'a>(ctx: &'a Context, w: Tensor<'a>, k: i64, width: i64) -> Tens
 /// [`ple_conv_time_major`]'s, in the same order: only the copies differ. The token-major
 /// window copies the chunk transposed into it and back once per tap, for a 4,096-token chunk
 /// five copies of 160 MiB on qwen4exp's first pipeline stage, the slowest stage of a long
-/// prompt (#462).
+/// prompt (#462). `mark`: the history's copy and the first tap's view are named for the PLE
+/// ops' rewrite ([`ple_fused::rewrite`]).
 fn ple_conv_rows<'a>(
     ctx: &'a Context,
     graph: &std::cell::RefCell<Graph<'a>>,
@@ -694,6 +724,7 @@ fn ple_conv_rows<'a>(
     state: Tensor<'a>,
     x: Tensor<'a>,
     ple: &PleParams,
+    mark: bool,
 ) -> Tensor<'a> {
     let (kern, dil, hist) = (ple.conv_kernel, ple.ngram as i64, ple.history());
     let [width, nt, ns, _] = x.ne();
@@ -708,13 +739,21 @@ fn ple_conv_rows<'a>(
             start as usize * nb[1],
         )
     };
-    graph
-        .borrow_mut()
-        .expand(ctx.cpy(ctx.transpose(window(nt, hist)), state));
+    let keep = ctx.cpy(ctx.transpose(window(nt, hist)), state);
+    let keep = if mark {
+        keep.named(ple_fused::rewrite::KEEP)
+    } else {
+        keep
+    };
+    graph.borrow_mut().expand(keep);
     let mut conv: Option<Tensor<'a>> = None;
     for k in 0..kern {
         let start = hist - (kern - 1 - k) * dil;
-        let term = ctx.mul(window(start, nt), ple_conv_tap(ctx, w, k, width));
+        let name = (mark && k == 0).then_some(ple_fused::rewrite::TAP);
+        let term = ctx.mul(
+            window(start, nt),
+            ple_conv_tap_named(ctx, w, k, width, name),
+        );
         conv = Some(match conv {
             Some(c) => ctx.add(c, term),
             None => term,
@@ -1563,19 +1602,24 @@ impl Model {
 
         let key = ctx.mul_mat(self.lw(il, "ple_key.weight")?, emb);
         let value = ctx.mul_mat(self.lw(il, "ple_value.weight")?, emb);
-        if let Some(out) = self.ple_ops(pass, il, res, key, value)? {
-            return Ok(out);
-        }
+        // Marked: the chain's nodes become the PLE ops once the graph is allocated as built.
+        let mark = self.ple_ops(pass, il, res, key, value)?;
+        let named = |t: Tensor<'a>, name: &str| if mark { t.named(name) } else { t };
+        let (key, value) = (
+            named(key, ple_fused::rewrite::KEY),
+            named(value, ple_fused::rewrite::VALUE),
+        );
+        let gamma_names = ple_fused::rewrite::GAMMAS;
         // RMS norm per stream, one gamma per stream.
-        let grouped_norm = |x: Tensor<'a>, w: &str| -> Result<Tensor<'a>, ModelError> {
+        let grouped_norm = |x: Tensor<'a>, w: &str, g: usize| -> Result<Tensor<'a>, ModelError> {
             let x = ctx.reshape_3d(x, e, hc, n);
             Ok(ctx.mul(
                 ctx.rms_norm(x, hp.rms_eps),
-                ctx.reshape_2d(self.lw(il, w)?, e, hc),
+                named(ctx.reshape_2d(self.lw(il, w)?, e, hc), gamma_names[g]),
             ))
         };
-        let key = grouped_norm(key, "ple_norm_key.weight")?;
-        let query = grouped_norm(res, "ple_norm_query.weight")?;
+        let key = grouped_norm(key, "ple_norm_key.weight", 0)?;
+        let query = grouped_norm(res, "ple_norm_query.weight", 1)?;
         // Per-stream dot product, signed square root, sigmoid.
         let s = ctx.sum_rows(ctx.mul(key, query));
         let s = ctx.scale(s, 1.0 / (e as f32).sqrt());
@@ -1584,8 +1628,8 @@ impl Model {
         tap.tap("ple_gate", il, gate);
         let v3 = ctx.repeat_4d(ctx.reshape_3d(value, e, 1, n), [e, hc, n, 1]);
         let gated = ctx.mul(v3, gate);
-        let normalized = grouped_norm(ctx.reshape_2d(gated, hc_dim, n), "ple_norm_conv.weight")?;
-        let normalized = ctx.reshape_2d(normalized, hc_dim, n);
+        let normalized = grouped_norm(ctx.reshape_2d(gated, hc_dim, n), "ple_norm_conv.weight", 2)?;
+        let normalized = ctx.reshape_2d(named(normalized, ple_fused::rewrite::XN), hc_dim, n);
 
         // Depthwise causal conv dilated by the n-gram size, as a sum of shifted copies over
         // [history | this chunk]; tap k reads (kernel - 1 - k) × n-gram positions back.
@@ -1594,10 +1638,11 @@ impl Model {
         for (off, sh) in pass.groups() {
             let (nt, ns) = (sh.n_tok as i64, sh.n_seqs as i64);
             let x = ctx.reshape_3d(cols(ctx, normalized, off, nt * ns), hc_dim, nt, ns);
+            let x = named(x, ple_fused::rewrite::X);
             let state = pass.rec.ple_slots(ctx, il, sh.slot, sh.n_seqs);
             ple_captures(pass, il, sh, x, ple.history());
             if !sh.verify && nt > 1 {
-                outs.push(ple_conv_rows(ctx, &pass.graph, w, state, x, ple));
+                outs.push(ple_conv_rows(ctx, &pass.graph, w, state, x, ple, mark));
                 continue;
             }
             let padded = ctx.concat(state, ctx.transpose(x), 0);
@@ -1613,14 +1658,20 @@ impl Model {
         let conv = ctx.silu(concat_cols(ctx, outs));
         let conv = ctx.reshape_3d(ctx.cont(conv), e, hc, n);
         tap.tap("ple_conv_out", il, conv);
-        Ok(ctx.add(res, ctx.add(gated, conv)))
+        Ok(named(
+            ctx.add(res, ctx.add(gated, conv)),
+            ple_fused::rewrite::OUT,
+        ))
     }
 
-    /// [`Self::ple`] after its two matmuls as Legion's two ops ([`ple_fused`]: ggml-cuda's bits
-    /// in two launches per group instead of about thirty nodes), for prompt steps on a GPU:
-    /// every group a prompt chunk (more than one token, not a verify), the weights and the
-    /// histories in GPU memory, no tensors tapped. `None` where they do not fit or are off
-    /// (`--ple-ops`; ggml's chain).
+    /// Whether [`Self::ple`]'s chain after its two matmuls is marked to run as Legion's two ops
+    /// ([`ple_fused`]: ggml-cuda's bits in two launches instead of about thirty nodes), for
+    /// prompt steps on a GPU: one group, a prompt chunk (more than one token, not a verify),
+    /// the weights and the history in GPU memory, no tensors tapped. On with `--ple-ops`, and
+    /// with `--dense-fp8-prompt` (#1183: ~85 ms of ggml's chain per 12,288-token step on a
+    /// GB10). The graph is built and allocated with the chain, so ggml-cuda fuses the MoE sums
+    /// it fuses without the ops; the ops take the chain's nodes after that
+    /// ([`ple_fused::rewrite`]). The first prompt step that keeps the chain logs why, once.
     fn ple_ops<'a>(
         &'a self,
         pass: &Pass<'a>,
@@ -1628,13 +1679,17 @@ impl Model {
         res: Tensor<'a>,
         key: Tensor<'a>,
         value: Tensor<'a>,
-    ) -> Result<Option<Tensor<'a>>, ModelError> {
-        if !ple_fused::fused_ple() {
-            return Ok(None);
+    ) -> Result<bool, ModelError> {
+        // Decode and verify steps keep ggml's chain by design (not logged).
+        if !pass.groups().all(|(_, sh)| !sh.verify && sh.n_tok > 1) {
+            return Ok(false);
+        }
+        // Not asked for (not logged: the reasons logged are of steps that asked).
+        if !(ple_fused::fused_ple() || self.dense_fp8_mode() == 3) {
+            return Ok(false);
         }
         let ctx = pass.ctx;
-        let hp = &self.hp;
-        let (e, n) = (hp.n_embd, pass.n);
+        let e = self.hp.n_embd;
         let hc = self.qwen4().hc.n;
         let ple = self.qwen4().ple.as_ref().expect("per-layer embedding");
         let gammas = [
@@ -1645,61 +1700,65 @@ impl Model {
         let w = self.lw(il, "ple_conv1d.weight")?;
         let on_gpu = |t: Tensor<'_>| !t.is_host() && !t.is_meta();
         let f32_rows = |t: Tensor<'_>| t.ty() == types::F32 && t.nb()[0] == 4;
-        let groups_fit = pass.groups().all(|(_, sh)| !sh.verify && sh.n_tok > 1);
-        let states: Vec<_> = if groups_fit {
-            pass.groups()
-                .map(|(_, sh)| pass.rec.ple_slots(ctx, il, sh.slot, sh.n_seqs))
-                .collect()
-        } else {
-            Vec::new()
+        let states: Vec<_> = pass
+            .groups()
+            .map(|(_, sh)| pass.rec.ple_slots(ctx, il, sh.slot, sh.n_seqs))
+            .collect();
+        let weight_ok = |g: Tensor<'_>, bf16: bool| {
+            (g.ty() == types::F32 || (bf16 && g.ty() == types::BF16))
+                && g.is_contiguous()
+                && on_gpu(g)
         };
-        let fits = cfg!(feature = "cuda")
-            && !pass.tap.on
-            && hc == ple_fused::PLE_HC
-            && e >= ple_fused::PLE_MIN_E
-            && gammas
-                .iter()
-                .chain([&w])
-                .all(|&g| g.ty() == types::F32 && g.is_contiguous() && on_gpu(g))
-            && w.ne()[0] == ple.conv_kernel
-            && f32_rows(res)
-            && res.nb()[1] == e as usize * 4
-            && f32_rows(key)
-            && f32_rows(value)
-            && groups_fit
-            && states.iter().all(|&s| on_gpu(s));
-        if !fits {
-            return Ok(None);
+        // Why the ops do not take this step, the first reason found.
+        let why = if !cfg!(feature = "cuda") {
+            Some("not a CUDA build".to_string())
+        } else if states.len() != 1 {
+            Some(format!(
+                "{} groups in the step (the ops take one)",
+                states.len()
+            ))
+        } else if pass.tap.on {
+            Some("tensors are tapped".to_string())
+        } else if hc != ple_fused::PLE_HC || e < ple_fused::PLE_MIN_E {
+            Some(format!(
+                "{hc} streams of {e} (the kernels take 4 of 1,024 or more)"
+            ))
+        } else if let Some(g) = gammas.iter().find(|&&g| !weight_ok(g, false)) {
+            Some(format!(
+                "{} is {} (contiguous F32 in GPU memory wanted)",
+                g.name(),
+                crate::ggml::type_name(g.ty())
+            ))
+        } else if !weight_ok(w, true) || w.ne()[0] != ple.conv_kernel {
+            Some(format!(
+                "{} is {} {:?} (contiguous F32 or BF16 [{}, e * hc] in GPU memory wanted)",
+                w.name(),
+                crate::ggml::type_name(w.ty()),
+                w.ne(),
+                ple.conv_kernel
+            ))
+        } else if !(f32_rows(res) && res.nb()[1] == e as usize * 4) {
+            Some(format!(
+                "the streams are {} with strides {:?}",
+                crate::ggml::type_name(res.ty()),
+                res.nb()
+            ))
+        } else if !(f32_rows(key) && f32_rows(value)) {
+            Some(format!(
+                "the key and value are {} and {}",
+                crate::ggml::type_name(key.ty()),
+                crate::ggml::type_name(value.ty())
+            ))
+        } else if !states.iter().all(|&s| on_gpu(s)) {
+            Some("the conv histories are not in GPU memory".to_string())
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            off_once(&PLE_OPS_OFF, "PLE ops", &why);
+            return Ok(false);
         }
-        let (xn, gate) = ple_fused::gate_norm(
-            ctx,
-            key,
-            res,
-            value,
-            gammas,
-            hp.rms_eps,
-            1.0 / (e as f32).sqrt(),
-            1e-6,
-        );
-        let streams = ctx.view_2d(res, [e * hc, n], res.nb()[2], 0);
-        let mut outs = Vec::new();
-        for ((off, sh), state) in pass.groups().zip(states) {
-            let (nt, ns) = (sh.n_tok as i64, sh.n_seqs as i64);
-            let m = nt * ns;
-            ple_captures(pass, il, sh, cols(ctx, xn, off, m), ple.history());
-            outs.push(ple_fused::conv_out(
-                ctx,
-                cols(ctx, xn, off, m),
-                state,
-                w,
-                cols(ctx, value, off, m),
-                cols(ctx, gate, off, m),
-                cols(ctx, streams, off, m),
-                nt,
-                ple.ngram as i64,
-            ));
-        }
-        Ok(Some(ctx.reshape_3d(concat_cols(ctx, outs), e, hc, n)))
+        Ok(true)
     }
 
     /// Where the per-layer n-gram table is in the model file (`(tensor, type, row elements)`),
