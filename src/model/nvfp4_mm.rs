@@ -116,6 +116,28 @@ pub fn set_down_x_prefetch(on: bool) {
     DOWN_X_PREFETCH.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+static DOWN_WIDE_STORE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether the routed experts' down projection GEMM of prompt steps ([`GEMM_DOWN`]) stages its
+/// outputs through shared memory and stores them 16 bytes a thread ([`DOWN_WST_F32`],
+/// [`DOWN_WST_BF16`], #1183). The same values in the same places either way. On by default;
+/// `legion serve --no-nvfp4-down-wide-store` turns it off (and the BF16 rows' streaming
+/// stores with it) for comparisons.
+pub fn set_down_wide_store(on: bool) {
+    DOWN_WIDE_STORE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+static DOWN_EVICT_FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether the routed experts' down projection GEMM of prompt steps ([`GEMM_DOWN`]) writes BF16
+/// rows with streaming (evict-first) stores on top of the staged ones ([`DOWN_WST_BF16`],
+/// #1183). F32 rows never do ([`DOWN_WST_F32`]), and [`set_down_wide_store`] off turns both
+/// off. The same bits either way. On by default; `legion serve
+/// --no-nvfp4-down-store-evict-first` turns it off for comparisons.
+pub fn set_down_store_evict_first(on: bool) {
+    DOWN_EVICT_FIRST.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 static PAD_SKIP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Whether a routed SwiGLU FFN on the grouped mv kernels ([`swiglu_id_rows`] with a row map,
@@ -1546,6 +1568,53 @@ pub fn grouped_gemm_xpf(k: i64, n_expert: i64, mi: i32, nt: i32, glu: bool) -> i
     }
 }
 
+/// `legion_nvfp4_mm::wst` bit 0 (`EPI_WIDE`): the grouped down tile's outputs staged through
+/// the free stages' shared memory, then stored 16 bytes a thread, a warp writing 512 bytes of
+/// one pair's row at a time (the fragments' own stores: 2 bytes a thread for BF16 rows, 16 bytes
+/// in each of 4 pairs' rows a warp instruction, half sectors). An eighth (BF16) or a quarter
+/// (F32) of the store instructions; the same values in the same places.
+pub const WST_WIDE: i32 = 1;
+/// `legion_nvfp4_mm::wst` bit 1 (`EPI_CS`): the down tile's output stores streaming
+/// (`st.global.cs`, evict-first in L2), so the 0.4-0.6 GB of rows a layer writes at long prompt
+/// steps leave the weights' and the prefetched activations' lines in L2. On by default for BF16
+/// rows only ([`DOWN_WST_BF16`]): on a DGX Spark (GB10) it took the staged BF16 rows' down GEMM
+/// from 1.096x to 1.124x the old one at 12,288 tokens (1.038x to 1.050x at 8,067), but F32
+/// rows' from 1.007x to 1.003x and 0.967x.
+pub const WST_CS: i32 = 2;
+
+/// The down projection's grouped GEMM's epilogue ([`GEMM_DOWN`], #1183) for BF16 rows
+/// (`--nvfp4-expert-rows-bf16`): staged and streaming, [`WST_WIDE`] | [`WST_CS`].
+pub const DOWN_WST_BF16: i32 = WST_WIDE | WST_CS;
+/// The down projection's grouped GEMM's epilogue ([`GEMM_DOWN`], #1183) for F32 rows: staged,
+/// [`WST_WIDE`] (streaming stores lose there).
+pub const DOWN_WST_F32: i32 = WST_WIDE;
+
+/// The epilogue (`legion_nvfp4_mm::wst`) of a grouped GEMM's launch writing BF16 (`bf16_rows`)
+/// or F32 rows, as [`grouped_gemm_tune`] picks its variant: for the down projection's
+/// [`GEMM_DOWN`] tile [`DOWN_WST_BF16`] or [`DOWN_WST_F32`] (without [`WST_CS`] when
+/// [`set_down_store_evict_first`] turned it off, 0 when [`set_down_wide_store`] did), 0 (the
+/// fragments' own stores) otherwise.
+pub fn grouped_gemm_wst(
+    k: i64,
+    n_expert: i64,
+    mi: i32,
+    nt: i32,
+    glu: bool,
+    bf16_rows: bool,
+) -> i32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let down = !glu && grouped_gemm_tune(k, n_expert, mi, nt, glu) == GEMM_DOWN;
+    if !down || !DOWN_WIDE_STORE.load(Relaxed) {
+        0
+    } else if !bf16_rows {
+        DOWN_WST_F32
+    } else if DOWN_EVICT_FIRST.load(Relaxed) {
+        DOWN_WST_BF16
+    } else {
+        DOWN_WST_BF16 & !WST_CS
+    }
+}
+
 /// Four stages, one CTA per SM: the grouped SwiGLU GEMM's tile of 64 tokens at up to
 /// [`MV_MAX_N`] pairs per expert (the GEMM there only under [`set_expert_mv_max`]).
 pub const GEMM_GLU_SHORT: GemmTune = GemmTune {
@@ -1605,6 +1674,7 @@ mod cuda {
         sel_hi: i32,
         unread_skips: i32,
         xpf: i32,
+        wst: i32,
     }
 
     /// `Params::sel_lo`, `sel_hi` for every expert.
@@ -1716,6 +1786,13 @@ mod cuda {
             }
             _ => 0,
         });
+        p.wst = forced_wst().unwrap_or(match kernel {
+            Kernel::Gemm { mi, nt } if !p.plan.is_null() => {
+                let bf16_rows = p.act == Act::Bf16.code() || p.act == Act::ReluSqr.code();
+                grouped_gemm_wst(p.k, p.n_expert as i64, mi, nt, false, bf16_rows)
+            }
+            _ => 0,
+        });
         // SAFETY: parameters checked by the callers; the node's stream.
         let code = unsafe {
             match kernel {
@@ -1756,6 +1833,16 @@ mod cuda {
 
     pub(super) fn forced_xpf() -> Option<i32> {
         match FORCED_XPF.load(Ordering::Relaxed) {
+            0 => None,
+            v => Some(v as i32 - 1),
+        }
+    }
+
+    /// [`super::force_gemm_wst`]'s epilogue plus one (0: none forced).
+    pub(super) static FORCED_WST: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn forced_wst() -> Option<i32> {
+        match FORCED_WST.load(Ordering::Relaxed) {
             0 => None,
             v => Some(v as i32 - 1),
         }
@@ -1837,6 +1924,7 @@ mod cuda {
             sel_hi: ALL.1,
             unread_skips: 0,
             xpf: 0,
+            wst: 0,
         };
         launch(&mut p, kernel, stream)
     }
@@ -1887,6 +1975,7 @@ mod cuda {
             sel_hi: ALL.1,
             unread_skips: 0,
             xpf: forced_xpf().unwrap_or(0),
+            wst: 0,
         };
         // SAFETY: parameters checked above; the node's stream.
         let code = unsafe {
@@ -2027,6 +2116,7 @@ mod cuda {
             sel_hi: split.map_or(ALL.1, |(cut, _)| cut),
             unread_skips: unread(dst) as i32,
             xpf: 0,
+            wst: 0,
         };
         if let Some(t) = forced_tiles() {
             p.tiles_n = p.tiles_n.min(t);
@@ -2215,6 +2305,7 @@ mod cuda {
             sel_hi: split.unwrap_or(ALL.1),
             unread_skips: unread(dst) as i32,
             xpf: forced_xpf().unwrap_or(0),
+            wst: 0,
         };
         if let Some(cut) = split {
             // The experts of more than `cut` pairs on the GEMM first, so the grouped SwiGLU mv
@@ -2334,6 +2425,21 @@ pub fn force_gemm_xpf(xpf: Option<i32>) {
     );
     #[cfg(not(feature = "cuda"))]
     let _ = xpf;
+}
+
+/// Launches every grouped GEMM from now on with the epilogue `wst` (`legion_nvfp4_mm::wst`:
+/// [`WST_WIDE`] and / or [`WST_CS`]; 0 the fragments' own stores), which the down projection's
+/// tile ([`GEMM_DOWN`]) takes and the others ignore; `None`: the defaults
+/// ([`grouped_gemm_wst`]). For tests and benches (#1183); the same bits either way.
+#[doc(hidden)]
+pub fn force_gemm_wst(wst: Option<i32>) {
+    #[cfg(feature = "cuda")]
+    cuda::FORCED_WST.store(
+        wst.map_or(0, |v| v.max(0) as u64 + 1),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    #[cfg(not(feature = "cuda"))]
+    let _ = wst;
 }
 
 /// `nvfp4_gemm`'s `DIAG_CAW`: the weight copies through L1 (`cp.async.ca`).

@@ -188,6 +188,12 @@ pub struct Switches {
     /// The routed experts' prompt-step down GEMM prefetching its activation rows into L2
     /// ([`crate::model::nvfp4_mm::set_down_x_prefetch`]).
     pub nvfp4_down_x_prefetch: Option<bool>,
+    /// The routed experts' prompt-step down GEMM storing its outputs 16 bytes a thread through
+    /// shared memory ([`crate::model::nvfp4_mm::set_down_wide_store`]).
+    pub nvfp4_down_wide_store: Option<bool>,
+    /// The routed experts' prompt-step down GEMM writing BF16 rows with evict-first stores
+    /// ([`crate::model::nvfp4_mm::set_down_store_evict_first`]).
+    pub nvfp4_down_store_evict_first: Option<bool>,
     /// The most pairs per routed expert on the grouped mv kernel, more on the grouped GEMM
     /// ([`crate::model::nvfp4_mm::set_expert_mv_max`]).
     pub nvfp4_expert_mv_max: Option<i64>,
@@ -674,6 +680,14 @@ impl Switches {
         set(
             self.nvfp4_down_x_prefetch,
             crate::model::nvfp4_mm::set_down_x_prefetch,
+        );
+        set(
+            self.nvfp4_down_wide_store,
+            crate::model::nvfp4_mm::set_down_wide_store,
+        );
+        set(
+            self.nvfp4_down_store_evict_first,
+            crate::model::nvfp4_mm::set_down_store_evict_first,
         );
         if let Some(n) = self.nvfp4_expert_mv_max {
             crate::model::nvfp4_mm::set_expert_mv_max(n);
