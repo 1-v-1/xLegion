@@ -53,9 +53,28 @@
 //! cast stays alive until the codes are made. It is done here, not where the graph is built,
 //! because the graph as built must stay as it is: its layout decides which tails round as
 //! ggml-cuda's fused sum (a graph built with one cast fewer moved two of them).
+//!
+//! Early casts (#1183, after the folds; `--dense-fp8-prompt`): a BF16 FFN mixer's values are
+//! cast to BF16 for the routed experts' NVFP4 GEMM and read as F32 by the router and the shared
+//! expert's gate. The node fusion lets the mixer write that cast itself
+//! ([`Graph::mix_cast`]) only where the allocator put the cast clear of what the mixer reads
+//! and of the nodes in between, which in a prompt step held for about half of the layers (the
+//! cast often lands in the mixer's freed inputs). Here the mixer gets the cast as a source
+//! before the graph is planned again ([`crate::model::qwen4::set_mix_cast`]) and the cast node
+//! becomes a `GGML_OP_NONE` node without sources and with memory of its own: the allocator
+//! gives it memory with the mixer's other sources, alive from the mixer to the cast's last
+//! reader, so it shares nothing with what the mixer reads or writes or with any node in
+//! between. The same BF16 values (the mixer's rounding is the copy's); the copy kernel goes in
+//! every layer. [`Undo::holds`] checks the new layout keeps each cast clear.
+//!
+//! Conv codes (#1183, after the folds): the node fusion lets a gated DeltaNet's FP8 qkv GEMM
+//! run the conv reading its output in its epilogue ([`Graph::conv_gemm`]), the conv then
+//! reading the GEMM's activation codes, which the allocator frees after their last GEMM. Here
+//! each such conv gets the codes as a source before the graph is planned again
+//! ([`Graph::conv_codes`]), so they stay alive until it runs.
 
 use std::collections::hash_map::Entry;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::{
     AddrMap, FMA_SKIP, Gate, Graph, MOE_SUM_GATE, Node, ON, Sum, f32_contiguous, is_view_op, root,
@@ -63,20 +82,29 @@ use super::{
 };
 use crate::ggml::post_alloc::{Relaid, Relayout};
 use crate::ggml::{ffi, make_external};
-use crate::model::nvfp4_mm;
+use crate::model::core::fused;
 use crate::model::qwen4::{
     FoldSum, compact_plan, fold_moe, fold_target, lazy_fold_target, lazy_mix_target, lazy_parts,
-    lazy_streams, moe_fold, set_compact, set_lazy_fold, set_lazy_streams, set_no_res,
+    lazy_streams, mix_cast_reads, mix_cast_set, moe_fold, ple_rewrite, set_compact, set_lazy_fold,
+    set_lazy_streams, set_mix_cast, set_no_res,
 };
+use crate::model::{fp8, nvfp4_mm};
 use crate::tp_net::seq_par;
 
 /// The fold as a relayout (`crate::ggml::post_alloc::set_relayout`): only graphs holding a norm
 /// a tail may fold into ([`fold_target`]) take it, with [`crate::model::qwen4::set_moe_fold`]
-/// and the node fusion (`legion serve --node-fuse-ggml` turns both off) on.
+/// and the node fusion (`legion serve --node-fuse-ggml` turns both off) on. Graphs holding a
+/// PLE chain marked for the PLE ops take it too: the ops take the chain's nodes first
+/// ([`crate::model::qwen4::ple_rewrite`]), and the sums ggml-cuda fuses, folded or not, are
+/// the ones of the graph as built.
 pub(crate) const RELAYOUT: Relayout = Relayout { wants, rewrite };
 
 /// Relayouts whose counts were logged (the first few only).
 static LOGGED: AtomicUsize = AtomicUsize::new(0);
+
+/// The source slot of a conv that [`Graph::conv_codes`] gives the GEMM's codes: past the conv's
+/// input, state, kernel and prefetched weight (left empty there).
+const CONV_CODES: usize = 4;
 
 /// Relayouts undone (logged the first time).
 static UNDONE: AtomicUsize = AtomicUsize::new(0);
@@ -89,11 +117,35 @@ static UNREAD: AtomicUsize = AtomicUsize::new(0);
 /// relayouts).
 static TAKEN: AtomicUsize = AtomicUsize::new(0);
 
+/// Whether folded graphs get early casts (see the module doc): set with `--dense-fp8-prompt`
+/// ([`set_early_cast`]).
+static EARLY_CAST: AtomicBool = AtomicBool::new(false);
+
+/// Early casts undone because a new layout put a cast over what its mixer reads (logged the
+/// first time).
+static EARLY_UNDONE: AtomicUsize = AtomicUsize::new(0);
+
+/// Sets whether graphs the fold takes from now on have their BF16 FFN mixers write their
+/// routed experts' BF16 cast, planned as a source of the mixer (see the module doc); on with
+/// `--dense-fp8-prompt` ([`crate::model::core::Model::set_dense_fp8_prompt`]).
+pub(crate) fn set_early_cast(on: bool) {
+    EARLY_CAST.store(on, Ordering::Relaxed);
+}
+
 /// [`Relayout::wants`].
 ///
 /// # Safety
 /// A live graph.
 unsafe fn wants(graph: *mut ffi::ggml_cgraph, cuda: bool) -> bool {
+    // SAFETY: the caller's.
+    unsafe { ple_rewrite::marked(graph) || fold_wants(graph, cuda) }
+}
+
+/// Whether the fold takes `graph` (see [`RELAYOUT`]).
+///
+/// # Safety
+/// A live graph.
+unsafe fn fold_wants(graph: *mut ffi::ggml_cgraph, cuda: bool) -> bool {
     if !moe_fold() || !ON.load(Ordering::Relaxed) {
         return false;
     }
@@ -114,18 +166,40 @@ unsafe fn wants(graph: *mut ffi::ggml_cgraph, cuda: bool) -> bool {
 /// # Safety
 /// As [`crate::ggml::post_alloc::Rewrite`].
 unsafe fn rewrite(graph: *mut ffi::ggml_cgraph, cuda: bool) -> Option<Box<dyn Relaid>> {
+    // A graph without a marked PLE chain was taken for the fold (by [`wants`], or by the
+    // relayout a test sets): folded as before the PLE ops. One with a chain is folded too only
+    // where the fold wants it.
     // SAFETY: the caller's.
-    let (undo, folded, fma) = unsafe { fold_graph(graph, cuda) };
-    if folded == 0 {
+    let fold = unsafe { !ple_rewrite::marked(graph) || fold_wants(graph, cuda) };
+    // The PLE ops first, the fold then sees the graph's readers as they run; neither moves a
+    // node's memory before the graph is planned again.
+    let mut ple_saved = Vec::new();
+    // SAFETY: the caller's.
+    let ple = unsafe { ple_rewrite::rewrite(graph, &mut ple_saved) };
+    // SAFETY: the caller's.
+    let (mut undo, folded, fma) = unsafe {
+        if fold {
+            fold_graph(graph, cuda)
+        } else {
+            (unfolded(graph, cuda), 0, 0)
+        }
+    };
+    undo.saved.splice(0..0, ple_saved);
+    undo.ple = ple > 0;
+    if folded == 0 && ple == 0 {
+        // SAFETY: the caller's; nothing was rewritten unless the fold's streams were.
+        unsafe { undo.undo(graph) };
         return None;
     }
-    if LOGGED.fetch_add(1, Ordering::Relaxed) < 4 {
+    if folded > 0 && LOGGED.fetch_add(1, Ordering::Relaxed) < 4 {
         tracing::info!(
             folded,
             fma,
             lazy_streams = undo.lazy,
             compact = undo.compact,
             one_cast = undo.one_cast,
+            early_cast = undo.early.len(),
+            conv_codes = undo.conv_codes,
             left = undo.left.len(),
             unread = UNREAD.load(Ordering::Relaxed),
             by_exchange = TAKEN.load(Ordering::Relaxed),
@@ -155,6 +229,9 @@ pub(crate) unsafe fn fold_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> (Un
             lazy: 0,
             compact: 0,
             one_cast: 0,
+            early: Vec::new(),
+            conv_codes: 0,
+            ple: false,
         };
         let (mut folded, mut fma) = (0, 0);
         for i in 0..n {
@@ -179,8 +256,43 @@ pub(crate) unsafe fn fold_graph(graph: *mut ffi::ggml_cgraph, cuda: bool) -> (Un
         // only where the graph is planned again (some tail folded).
         if folded > 0 {
             undo.one_cast = g.one_cast(&mut undo.saved);
+            if EARLY_CAST.load(Ordering::Relaxed) {
+                undo.early = g.early_casts(&mut undo.saved);
+            }
+            if cuda {
+                undo.conv_codes = g.conv_codes(&mut undo.saved);
+            }
         }
         (undo, folded, fma)
+    }
+}
+
+/// How to check and undo a graph whose sums are all left as built (only its PLE chains
+/// rewritten): every sum, and whether ggml-cuda fuses it in the graph as built.
+///
+/// # Safety
+/// As [`fold_graph`].
+unsafe fn unfolded(graph: *mut ffi::ggml_cgraph, cuda: bool) -> Undo {
+    // SAFETY: the caller's: a live graph whose node array holds `n` valid tensors.
+    unsafe {
+        let n = ffi::ggml_graph_n_nodes(graph) as usize;
+        let nodes = std::slice::from_raw_parts(ffi::ggml_graph_nodes(graph), n).to_vec();
+        let g = Graph::new(graph, nodes);
+        let left = (0..n)
+            .filter(|&i| !g.none[i] && (*g.nodes[i]).op == ffi::ggml_op_GGML_OP_MUL)
+            .filter_map(|i| g.match_sum(i).map(|s| (i, cuda && g.ggml_fuses_sum(&s))))
+            .collect();
+        Undo {
+            left,
+            saved: Vec::new(),
+            cuda,
+            lazy: 0,
+            compact: 0,
+            one_cast: 0,
+            early: Vec::new(),
+            conv_codes: 0,
+            ple: false,
+        }
     }
 }
 
@@ -198,10 +310,74 @@ pub(crate) struct Undo {
     pub(crate) compact: usize,
     /// BF16 casts that became views of an earlier cast of the same values (see the module doc).
     pub(crate) one_cast: usize,
+    /// Mixers that write their BF16 cast, planned as their source, and the casts (early casts,
+    /// see the module doc).
+    pub(crate) early: Vec<(Node, Node)>,
+    /// Convs given their input GEMM's codes as a source (conv codes, see the module doc).
+    pub(crate) conv_codes: usize,
+    /// The PLE ops took chains of the graph: undone, it runs in the layout it had as built
+    /// ([`Relaid::as_built`]). A graph only folded is planned afresh, as before them.
+    pub(crate) ple: bool,
+}
+
+/// Whether each early cast (`early`: mixers and their casts, [`Graph::early_casts`]) is still
+/// its mixer's copy and shares no memory with the mixer's output or what the mixer reads
+/// ([`mix_cast_set`]) in the graph's layout now.
+///
+/// # Safety
+/// Valid tensors of an allocated graph.
+unsafe fn early_casts_clear(early: &[(Node, Node)]) -> bool {
+    // SAFETY: the caller's.
+    unsafe {
+        early.iter().all(|&(mix, cast)| {
+            let Some((c, reads)) = mix_cast_set(mix) else {
+                return false;
+            };
+            let (c0, c1) = span(cast);
+            let hits = |(a, b): (usize, usize)| a < b && a < c1 && c0 < b;
+            c == cast && c0 < c1 && !hits(span(mix)) && !reads.iter().any(|&r| hits(r))
+        })
+    }
+}
+
+/// A relayout of early casts alone ([`Graph::early_casts`]), for the tests: every graph, as
+/// on CUDA.
+#[cfg(test)]
+pub(crate) const EARLY_CAST_RELAYOUT: Relayout = Relayout {
+    wants: early_wants,
+    rewrite: early_rewrite,
+};
+
+#[cfg(test)]
+unsafe fn early_wants(_graph: *mut ffi::ggml_cgraph, _cuda: bool) -> bool {
+    true
+}
+
+#[cfg(test)]
+unsafe fn early_rewrite(graph: *mut ffi::ggml_cgraph, _cuda: bool) -> Option<Box<dyn Relaid>> {
+    // SAFETY: the caller's: a live graph whose node array holds `n` valid tensors.
+    unsafe {
+        let n = ffi::ggml_graph_n_nodes(graph) as usize;
+        let nodes = std::slice::from_raw_parts(ffi::ggml_graph_nodes(graph), n).to_vec();
+        let mut g = Graph::new(graph, nodes);
+        let mut undo = unfolded(graph, false);
+        undo.early = g.early_casts(&mut undo.saved);
+        Some(Box::new(undo))
+    }
 }
 
 impl Relaid for Undo {
     unsafe fn holds(&self, graph: *mut ffi::ggml_cgraph) -> bool {
+        // SAFETY: the caller's: a live, allocated graph of valid tensors.
+        if !unsafe { early_casts_clear(&self.early) } {
+            if EARLY_UNDONE.fetch_add(1, Ordering::Relaxed) == 0 {
+                tracing::info!(
+                    "hc moe fold: an early BF16 cast shares memory with what its mixer reads in \
+                     the folded graph's layout; that graph is left as built (logged once)"
+                );
+            }
+            return false;
+        }
         if !self.cuda || self.left.is_empty() {
             return true;
         }
@@ -225,10 +401,15 @@ impl Relaid for Undo {
     }
 
     unsafe fn undo(&self, _graph: *mut ffi::ggml_cgraph) {
-        for (t, was) in &self.saved {
+        // Last saved first: a node saved twice ends as it was first.
+        for (t, was) in self.saved.iter().rev() {
             // SAFETY: the caller's: the graph's nodes, saved whole before the rewrite.
             unsafe { std::ptr::copy_nonoverlapping(was, *t, 1) };
         }
+    }
+
+    fn as_built(&self) -> bool {
+        self.ple
     }
 }
 
@@ -795,6 +976,97 @@ impl Graph {
                 && ffi::ggml_nelements(x) == n
                 && ffi::ggml_nelements(src) == n)
                 .then_some(src)
+        }
+    }
+
+    /// Early casts (see the module doc): every BF16 mixer ([`mix_cast_reads`]) whose values are
+    /// read as F32 by another node too and whose BF16 cast ([`Self::bf16_cast_of`]) is no graph
+    /// output gets the cast as a source ([`set_mix_cast`], the F32 values still written), and
+    /// the cast becomes a `GGML_OP_NONE` node without sources, keeping its memory (no view);
+    /// a view of the mixer only that cast read is retired, so it does not keep the mixer's
+    /// memory alive. Mixers only their cast reads (the attention's) are left to the node
+    /// fusion. Saves the nodes it changes first (each once). The mixers and their casts.
+    ///
+    /// # Safety
+    /// This graph's nodes are valid tensors of an allocated graph that has not run.
+    pub(crate) unsafe fn early_casts(
+        &mut self,
+        saved: &mut Vec<(Node, ffi::ggml_tensor)>,
+    ) -> Vec<(Node, Node)> {
+        // SAFETY: the caller's; nodes, their sources and their readers are valid tensors.
+        unsafe {
+            let output = ffi::ggml_tensor_flag_GGML_TENSOR_FLAG_OUTPUT as i32;
+            let mut made = Vec::new();
+            for at in 0..self.nodes.len() {
+                let mix = self.nodes[at];
+                if self.none[at]
+                    || (*mix).op != ffi::ggml_op_GGML_OP_CUSTOM
+                    || mix_cast_reads(mix).is_none()
+                {
+                    continue;
+                }
+                let Some(j) = self.bf16_cast_of(mix) else {
+                    continue;
+                };
+                let cast = self.nodes[j];
+                if (*cast).flags & output != 0 || self.only_read_by(mix, &[j]) {
+                    continue;
+                }
+                // The view the cast read all of the mixer through, if a node.
+                let via = (*cast).src[0];
+                let view = (via != mix)
+                    .then(|| self.index.get(&(via as usize)).copied())
+                    .flatten();
+                for t in [mix, cast].into_iter().chain(view.map(|v| self.nodes[v])) {
+                    if !saved.iter().any(|&(s, _)| s == t) {
+                        saved.push((t, std::ptr::read(t)));
+                    }
+                }
+                set_mix_cast(mix, cast, false);
+                let c = &mut *cast;
+                c.op = ffi::ggml_op_GGML_OP_NONE;
+                c.op_params = [0; ffi::GGML_MAX_OP_PARAMS as usize / 4];
+                c.src = [std::ptr::null_mut(); ffi::GGML_MAX_SRC as usize];
+                self.none[j] = true;
+                if let Some(v) = view {
+                    self.retire_unread(&mut [v], mix);
+                }
+                made.push((mix, cast));
+            }
+            made
+        }
+    }
+
+    /// Conv codes (see the module doc): every gated DeltaNet conv whose input's FP8 GEMM may run
+    /// it ([`fused::gemm_allowed`], [`fp8::conv_gemm`]) gets the GEMM's activation codes as a
+    /// source too (one it does not read, past its own), so they stay alive until the conv in
+    /// the new plan. Saves the convs it changes first. How many.
+    ///
+    /// # Safety
+    /// This graph's nodes are valid tensors of an allocated graph that has not run.
+    pub(crate) unsafe fn conv_codes(&self, saved: &mut Vec<(Node, ffi::ggml_tensor)>) -> usize {
+        // SAFETY: the caller's; nodes and their sources are valid tensors.
+        unsafe {
+            let mut made = 0;
+            for (at, &conv) in self.nodes.iter().enumerate() {
+                if self.none[at] || !fused::gemm_allowed(conv) {
+                    continue;
+                }
+                let (x, src) = ((*conv).src[0], &(*conv).src);
+                if x.is_null() || !src[CONV_CODES - 1].is_null() || !src[CONV_CODES].is_null() {
+                    continue;
+                }
+                let mm8 = root(x);
+                if !self.index.contains_key(&(mm8 as usize)) || !fp8::conv_gemm(mm8) {
+                    continue;
+                }
+                if !saved.iter().any(|&(s, _)| s == conv) {
+                    saved.push((conv, std::ptr::read(conv)));
+                }
+                (*conv).src[CONV_CODES] = (*mm8).src[1];
+                made += 1;
+            }
+            made
         }
     }
 
