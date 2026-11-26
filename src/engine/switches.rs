@@ -164,6 +164,9 @@ pub struct Switches {
     /// W8A16 FP8 matmuls of 5-64 tokens on the sliced-K GEMM
     /// ([`crate::model::fp8::set_sliced_k`]).
     pub fp8_sliced_k: Option<bool>,
+    /// The shared expert's prompt-step W8A8 gate / up GEMM storing its outputs 16 bytes a
+    /// thread through shared memory ([`crate::model::fp8::set_glu_wide_store`]).
+    pub fp8_glu_wide_store: Option<bool>,
     /// W8A8 FP8 prompt GEMMs' outputs by TMA stores
     /// ([`crate::model::fp8::set_tma_store`]; on by default).
     pub fp8_tma_store: Option<bool>,
@@ -670,6 +673,10 @@ impl Switches {
             crate::model::fp8::set_small_batch_gemv,
         );
         set(self.fp8_sliced_k, crate::model::fp8::set_sliced_k);
+        set(
+            self.fp8_glu_wide_store,
+            crate::model::fp8::set_glu_wide_store,
+        );
         set(self.fp8_tma_store, crate::model::fp8::set_tma_store);
         set(
             self.fp8_conv_tma_store,

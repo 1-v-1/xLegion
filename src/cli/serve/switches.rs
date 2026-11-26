@@ -428,6 +428,14 @@ pub(in crate::cli) struct SwitchArgs {
     /// can differ from the default's where such steps occur. Off by default.
     #[arg(long, help_heading = HEADING)]
     fp8_sliced_k: bool,
+    /// CUDA, compute capability 8.9+, --dense-fp8-prompt: the shared expert's gate / up W8A8 GEMM
+    /// of prompt steps stores its F32 outputs straight from the MMA fragments, 4 bytes a thread
+    /// (the default on its cp.async tiles, e.g. 8,067-token steps on a GB10: staged through
+    /// shared memory and stored 16 bytes a thread, whole runs of each token's rows; the TMA-fed
+    /// tile keeps its own epilogue, see --no-fp8-tma-store). The same bits either way. For
+    /// comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_fp8_glu_wide_store: bool,
     /// CUDA, compute capability 12.x (GB10, consumer Blackwell), W8A8 FP8 prompt matmuls on the
     /// TMA-fed 256 x 128 tile without a residual (and the gated DeltaNet qkv GEMM with the conv
     /// in its epilogue): write the outputs from the MMA fragments, 4 bytes a lane, as before,
@@ -1627,6 +1635,7 @@ impl SwitchArgs {
             nvfp4_mmvq_glu: self.nvfp4_mmvq_glu.then_some(true),
             fp8_small_batch_gemv: self.fp8_small_batch_gemv.then_some(true),
             fp8_sliced_k: self.fp8_sliced_k.then_some(true),
+            fp8_glu_wide_store: self.no_fp8_glu_wide_store.then_some(false),
             fp8_tma_store: self.no_fp8_tma_store.then_some(false),
             fp8_conv_tma_store: self.no_fp8_conv_tma_store.then_some(false),
             fp8_wide_stagger: self.no_fp8_wide_stagger.then_some(false),
