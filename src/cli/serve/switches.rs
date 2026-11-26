@@ -69,6 +69,14 @@ pub(in crate::cli) struct SwitchArgs {
     /// and 12.1 only. For comparisons.
     #[arg(long, help_heading = HEADING)]
     gdn_prompt_ggml: bool,
+    /// CUDA, gated DeltaNet layers, prompt steps whose staged whole-head kernel also writes the
+    /// gated output norm (one GPU's Qwen3.8-Flash-Next layer): that kernel as it was, which
+    /// copies a chunk's z rows once the chunk is under way and keeps 12 warps idle during the
+    /// chunk's Gram, instead of the default form, which copies them one chunk ahead with the other
+    /// inputs and runs the Gram under the other warps' projections (the same arithmetic in the
+    /// same order, so the same bits). For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_gdn_ahead: bool,
     /// CUDA, gated DeltaNet layers in MTP verify and commit steps: ggml's gated_delta_net
     /// instead of Legion's op (the default: the same bits; the verify step skips the final
     /// states it never reads, the commit writes them in place instead of computing the rows and
@@ -428,6 +436,31 @@ pub(in crate::cli) struct SwitchArgs {
     /// can differ from the default's where such steps occur. Off by default.
     #[arg(long, help_heading = HEADING)]
     fp8_sliced_k: bool,
+    /// CUDA, compute capability 8.9+, --dense-fp8-prompt: the shared expert's gate / up W8A8 GEMM
+    /// of prompt steps stores its F32 outputs straight from the MMA fragments, 4 bytes a thread
+    /// (the default on its cp.async tiles, e.g. 8,067-token steps on a GB10: staged through
+    /// shared memory and stored 16 bytes a thread, whole runs of each token's rows; the TMA-fed
+    /// tile keeps its own epilogue, see --no-fp8-tma-store). The same bits either way. For
+    /// comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_fp8_glu_wide_store: bool,
+    /// CUDA, compute capability 12.x (GB10, consumer Blackwell), W8A8 FP8 prompt matmuls on the
+    /// TMA-fed 256 x 128 tile without a residual (and the gated DeltaNet qkv GEMM with the conv
+    /// in its epilogue): write the outputs from the MMA fragments, 4 bytes a lane, as before,
+    /// instead of staging them in shared memory and writing whole lines by TMA stores (by
+    /// default where the weight rows are longer than 1,024 bytes). The same bits either way.
+    #[arg(long, help_heading = HEADING)]
+    no_fp8_tma_store: bool,
+    /// CUDA, compute capability 12.x, W8A8 FP8 prompt matmuls on the TMA-fed 256 x 128 tile:
+    /// start every CTA of the first wave at once, as before. By default the first wave's start
+    /// is spread over about one tile's time so the SMs' epilogues don't all write at once. The
+    /// same bits either way.
+    #[arg(long, help_heading = HEADING)]
+    no_fp8_wide_stagger: bool,
+    /// As --no-fp8-tma-store, for the gated DeltaNet qkv GEMM with the conv in its epilogue
+    /// only. The same bits either way.
+    #[arg(long, help_heading = HEADING)]
+    no_fp8_conv_tma_store: bool,
     /// CUDA, compute capability 9.0 only (H100, H200, GH200) with a binary built for sm_90a
     /// (CMAKE_CUDA_ARCHITECTURES=90a): W8A8 FP8 prompt matmuls (more than 64 tokens) on the
     /// Hopper GEMM (warpgroup MMA fed by the TMA, a warp-specialized pipeline of 128 x 128 tiles,
@@ -488,6 +521,39 @@ pub(in crate::cli) struct SwitchArgs {
     /// ~3% faster expert FFNs). The same bits either way. For comparisons.
     #[arg(long, help_heading = HEADING)]
     no_nvfp4_expert_tile_prefetch: bool,
+    /// CUDA, NVFP4 routed experts on Legion's W4A16 kernels, prompt steps on the grouped GEMM:
+    /// the down projection's tiles do not prefetch activation rows into L2 (the default: the
+    /// tiles of the first row tile prefetch the rows of the token tile two ahead, so the copies
+    /// of a step stop waiting for scattered rows from DRAM). The same bits either way. For
+    /// comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_nvfp4_down_x_prefetch: bool,
+    /// CUDA, NVFP4 routed experts on Legion's W4A16 kernels, prompt steps on the grouped GEMM:
+    /// the down projection's tiles store their outputs straight from the MMA fragments, 2 or 4
+    /// bytes a thread (the default: staged through shared memory and stored 16 bytes a thread,
+    /// whole runs of each (token, expert) row; BF16 rows with evict-first stores too). Also
+    /// turns the evict-first stores off. The same bits either way. For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_nvfp4_down_wide_store: bool,
+    /// CUDA, NVFP4 routed experts on Legion's W4A16 kernels, prompt steps on the grouped GEMM,
+    /// --nvfp4-expert-rows-bf16: the down projection's staged stores are plain ones (the
+    /// default: evict-first, so the rows written leave the weights and activations in L2; F32
+    /// rows never use them). The same bits either way. For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_nvfp4_down_store_evict_first: bool,
+    /// CUDA, NVFP4 routed experts on Legion's W4A16 kernels, prompt steps on the grouped GEMM:
+    /// the fused gate / up (SwiGLU) tiles store their BF16 outputs straight from the MMA
+    /// fragments, 2 bytes a thread (the default: staged through shared memory and stored 16
+    /// bytes a thread, whole runs of each (token, expert) row). Also turns
+    /// --nvfp4-glu-store-evict-first off. The same bits either way. For comparisons.
+    #[arg(long, help_heading = HEADING)]
+    no_nvfp4_glu_wide_store: bool,
+    /// CUDA, NVFP4 routed experts on Legion's W4A16 kernels, prompt steps on the grouped GEMM:
+    /// the fused gate / up (SwiGLU) tiles' staged stores are evict-first ones (the default:
+    /// plain stores, so the rows stay in L2 for the down projection that reads them next). The
+    /// same bits either way.
+    #[arg(long, help_heading = HEADING)]
+    nvfp4_glu_store_evict_first: bool,
     /// CUDA, NVFP4 routed experts on Legion's W4A16 kernels: matmuls of up to this many (token,
     /// expert) pairs per used expert (if the routing were even) take the grouped mv kernel,
     /// more the grouped GEMM. Default 32: prompt steps of up to ~1,600 tokens on
@@ -1511,6 +1577,7 @@ impl SwitchArgs {
             gdn_scan: self.gdn_scan_ggml.then_some(false),
             gdn_mma: self.gdn_mma.then_some(true),
             gdn_staged: self.gdn_prompt_ggml.then_some(false),
+            gdn_ahead: self.no_gdn_ahead.then_some(false),
             gdn: self.gdn_ggml.then_some(false),
             gdn_decode: self.gdn_decode_ggml.then_some(false),
             gdn_replay_staged: self.gdn_replay_smem.then_some(true),
@@ -1577,6 +1644,10 @@ impl SwitchArgs {
             nvfp4_mmvq_glu: self.nvfp4_mmvq_glu.then_some(true),
             fp8_small_batch_gemv: self.fp8_small_batch_gemv.then_some(true),
             fp8_sliced_k: self.fp8_sliced_k.then_some(true),
+            fp8_glu_wide_store: self.no_fp8_glu_wide_store.then_some(false),
+            fp8_tma_store: self.no_fp8_tma_store.then_some(false),
+            fp8_conv_tma_store: self.no_fp8_conv_tma_store.then_some(false),
+            fp8_wide_stagger: self.no_fp8_wide_stagger.then_some(false),
             hopper_gemm: self.hopper_gemm.then_some(true),
             hopper_attn: self.hopper_attn.then_some(true),
             paged_prefill_qm: self.no_paged_prefill_qm.then_some(false),
@@ -1584,6 +1655,11 @@ impl SwitchArgs {
             nvfp4_wide_mv: self.nvfp4_wide_mv.then_some(true),
             nvfp4_expert_pdl: self.no_nvfp4_expert_pdl.then_some(false),
             nvfp4_expert_tile_prefetch: self.no_nvfp4_expert_tile_prefetch.then_some(false),
+            nvfp4_down_x_prefetch: self.no_nvfp4_down_x_prefetch.then_some(false),
+            nvfp4_down_wide_store: self.no_nvfp4_down_wide_store.then_some(false),
+            nvfp4_down_store_evict_first: self.no_nvfp4_down_store_evict_first.then_some(false),
+            nvfp4_glu_wide_store: self.no_nvfp4_glu_wide_store.then_some(false),
+            nvfp4_glu_store_evict_first: self.nvfp4_glu_store_evict_first.then_some(true),
             nvfp4_expert_mv_max: self.nvfp4_expert_mv_max.map(i64::from),
             nvfp4_expert_mv_tile: self.nvfp4_expert_mv_tile.map(i32::from),
             nvfp4_expert_mv_split: self.nvfp4_expert_mv_split,

@@ -41,7 +41,7 @@ pub use gdn::set_gdn_decode;
 pub use gdn::set_gdn_pad_skip;
 pub use gdn::set_gdn_replay_few;
 pub use gdn::set_gdn_replay_staged;
-pub use gdn_mma::{set_gdn_mma, set_gdn_staged};
+pub use gdn_mma::{set_gdn_ahead, set_gdn_mma, set_gdn_staged};
 pub use gdn_scan::set_gdn_scan;
 pub(crate) use graph_size::graph_size;
 pub use norm_rope::{set_kv_append, set_norm_rope};
@@ -5277,6 +5277,10 @@ impl Model {
                 .flatten()
             {
                 Some((gate, up)) => {
+                    // `--dense-fp8-prompt` (#1183): the W8A8 GEMM's F32 gate and up rows go
+                    // out 16 bytes a thread through shared memory (the same bits; plain stores,
+                    // as the SwiGLU's codes read them next). A BF16 GEMM is not marked.
+                    crate::model::fp8::mark_wide_store(gate);
                     let sh = ctx.swiglu_split(gate, up);
                     // `--dense-fp8-prompt` (#1183): the down projection's per-token FP8 codes
                     // from one op reading gate and up in place (the SwiGLU then not computed).
