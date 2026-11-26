@@ -22,7 +22,8 @@
 // Gemma 4's tower (`gemma4v`, #1217) shares the GEMM and the softmax and has its own: patches
 // in raster order scaled to [-1, 1], the column and row position tables, RMS norms (to F16 rows,
 // or a post-norm added to the residual), per-head q / k / v norms with the half-and-half NEOX
-// rotation, the gated GELU and the 3x3 average pool with its standardization and norm.
+// rotation, the gated GELU and the 3x3 average pool with its standardization and norm; the
+// smaller towers' clipped linears (#1220) clamp their inputs and products in place.
 //
 // GLM-5.3-Flash's tower (`glm5v`, #1219) takes Qwen3-VL's patches and rotation with Gemma 4's
 // RMS norm, and has its own per-head q / k norms before the rotation, the clamped SwiGLU and the
@@ -699,11 +700,37 @@ __global__ void ln_gelu_kernel(const Op o) {
     }
 }
 
+// A clipped linear's clamp (#1220), in place: rows [rows][width] of F32 or F16 (`f16`), column c
+// clamped to segment s = min(c / seg, 2)'s bounds, as ggml's `clamp` (min with hi, then max with
+// lo). A stacked matrix's products (q, k, v; gate, up) each take their own segment.
+struct Clamp {
+    void * x;
+    int    rows, width, seg, f16;
+    float  lo[3], hi[3];
+};
+
+// A block per row.
+__global__ void g4_clamp_kernel(const Clamp o) {
+    for (int r = blockIdx.x; r < o.rows; r += gridDim.x) {
+        for (int c = threadIdx.x; c < o.width; c += blockDim.x) {
+            const int       s = min(c / o.seg, 2);
+            const long long i = (long long) r * o.width + c;
+            if (o.f16) {
+                __half * p = static_cast<__half *>(o.x);
+                p[i]       = __float2half_rn(fmaxf(fminf(__half2float(p[i]), o.hi[s]), o.lo[s]));
+            } else {
+                float * p = static_cast<float *>(o.x);
+                p[i]      = fmaxf(fminf(p[i], o.hi[s]), o.lo[s]);
+            }
+        }
+    }
+}
+
 }  // namespace
 
 // The kernels as the CUDA runtime knows them (their host stubs), for Rust's cudaLaunchKernel, in
 // the order of src/vision/gpu.rs's `Kernel`.
-extern "C" const void * const legion_vision_kernels[16] = {
+extern "C" const void * const legion_vision_kernels[17] = {
     reinterpret_cast<const void *>(&gemm_kernel),      reinterpret_cast<const void *>(&im2col_kernel),
     reinterpret_cast<const void *>(&pos_add_kernel),   reinterpret_cast<const void *>(&norm_kernel),
     reinterpret_cast<const void *>(&rope_kernel),      reinterpret_cast<const void *>(&softmax_kernel),
@@ -712,4 +739,5 @@ extern "C" const void * const legion_vision_kernels[16] = {
     reinterpret_cast<const void *>(&g4_qkv_kernel),    reinterpret_cast<const void *>(&geglu_kernel),
     reinterpret_cast<const void *>(&g4_pool_kernel),   reinterpret_cast<const void *>(&glm_qkv_kernel),
     reinterpret_cast<const void *>(&swiglu_clamp_kernel), reinterpret_cast<const void *>(&ln_gelu_kernel),
+    reinterpret_cast<const void *>(&g4_clamp_kernel),
 };

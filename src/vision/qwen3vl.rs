@@ -177,6 +177,9 @@ impl Encoder {
         for name in enc.names() {
             enc.w(&name)?;
         }
+        if enc.hp.projector == super::Projector::Gemma4v {
+            super::gemma4v::check(&enc.weights, enc.cfg.n_layer)?;
+        }
         Ok(enc)
     }
 
