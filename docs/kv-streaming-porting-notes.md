@@ -202,6 +202,31 @@ kv stats: decode steps read <host> of <total> selected cells from host blocks
 - 辅助核对：`fetch ≈ 稳态增速 × unique`；`unique/rows` 持续增长 = 选择无复用。
 - 顺带验收位级不动：同请求开/关 `LEGION_DEBUG_KV_STATS` 贪心输出逐字节一致。
 
+### 5.3 实测结果与判定（2026-11-27）
+
+场景：4 设备 layer-split、expert cache 在跑（AC922 一类的 4×V100 配置，`--ctx-size` 让
+KV 出现 host tier）。上下文增长后序列越过 VRAM 段、进入 host 段，decode 占比稳定爬升：
+
+| 数字（dev=0，累计） | 值 |
+|---|---|
+| decode 选中单元落 host 区 | 23.9M / 56.2M = **42.5%**（30 s 增速 +7.2M，仍在涨） |
+| decode 去重后的 block fetches | 1,405,098 |
+| host 区被触达的唯一块 | ~1.3K（增长极慢） |
+| Top-1K 块覆盖 fetches | **93%**；Top-8K = 100% |
+| 复用倍数 fetches/unique | ≈ **1000×** |
+| prompt 侧 | 20.8% cells 走 host、35.6M fetches（一次性，同一热集） |
+
+**判定：Go，姿态 B。** 依据：`cells_host` 占比高（42.5%）、Top-1K 覆盖 93%（≥70%
+阈值）、复用 1000×（每块重复拉取千次——slot 缓存的收益来源）；expert cache 日志
+（hit_rate 0.645→0.887、swaps 持续增长）说明 VRAM 已被 expert cache 吃紧 → 把 KV 的
+VRAM 窗收缩到 slot 工作集（实测热集 ~1.3K 块，取 ~2K 块窗），腾出的 VRAM 给 expert
+slots，链路折减与腾显存一起拿。Phase 1 在同机跑 `--no-kv-slot-cache` 的开/关 A/B 确认
+decode tok/s 与同文本贪心一致。
+
+测量工具本身被这轮暴露并已修复一处口径缺陷：直方图原为 decode/prompt 共用一份，decode
+行报过 `0 fetches, 946 unique` 的自相矛盾行（commit `38ff015` 改为 per-bucket 双份）。
+判定数字不受影响（两 bucket 的 unique 相同 = 同一热集）。
+
 
 
 ## 6. 开放问题
