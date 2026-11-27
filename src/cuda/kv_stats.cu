@@ -19,8 +19,9 @@
 //   ctl[off+2] host block fetches                (deduplicated per row: what a slot pool
 //                                                 would move once and could then keep)
 //   ctl[off+3] rows                              (selected cells per row = the selection width)
-// and hist[b] counts the fetches of host block b, the concentration a cache of S slots
-// could absorb.
+// and hist[bucket * n_host + b] counts the fetches of host block b per bucket, the
+// concentration a cache of S slots could absorb (the slot pool would be shared, but a
+// decode step's and a prompt step's hot sets are reported apart).
 
 #include <cuda_runtime.h>
 
@@ -30,7 +31,7 @@
 namespace {
 
 struct Ctr {
-    unsigned long long* hist = nullptr;  // (n_host,) fetches per host block
+    unsigned long long* hist = nullptr;  // (2, n_host) fetches per host block, per bucket
     unsigned long long* ctl = nullptr;   // 16 u64
     long long n_host = 0;
     long long hbm = 0;  // the pool's first host block (the registered one, not the baked)
@@ -95,9 +96,9 @@ int legion_kv_stats_ensure(int dev, long long n_host, long long hbm) {
     int prev;
     cudaGetDevice(&prev);
     cudaSetDevice(dev);
-    bool ok = cudaMalloc((void**)&c.hist, (size_t)n_host * sizeof(long long)) == cudaSuccess &&
+    bool ok = cudaMalloc((void**)&c.hist, 2 * (size_t)n_host * sizeof(long long)) == cudaSuccess &&
               cudaMalloc((void**)&c.ctl, 16 * sizeof(long long)) == cudaSuccess &&
-              cudaMemset(c.hist, 0, (size_t)n_host * sizeof(long long)) == cudaSuccess &&
+              cudaMemset(c.hist, 0, 2 * (size_t)n_host * sizeof(long long)) == cudaSuccess &&
               cudaMemset(c.ctl, 0, 16 * sizeof(long long)) == cudaSuccess;
     cudaSetDevice(prev);
     if (!ok) {
@@ -127,11 +128,11 @@ void legion_kv_stats_after(const int* sel, long long sel_nb1, const int* tab, lo
     if (grid > 0x7fffffffLL) return;  // a selection that wide is a bug, not a measurement
     kv_stats_kernel<<<(int)grid, block, 0, (cudaStream_t)stream>>>(
         sel, sel_nb1, tab, tab_nb1, cap, rows, n_tok, it->second.hbm, it->second.n_host, off,
-        it->second.hist, it->second.ctl);
+        it->second.hist + (long long)(off / 8) * it->second.n_host, it->second.ctl);
 }
 
-/// Copies device `dev`'s counters out: `ctl` holds 16 values, `hist` the n_host the ensure
-/// built. A CUDA error code, 0 for good; 3: the device has no counters.
+/// Copies device `dev`'s counters out: `ctl` holds 16 values, `hist` twice the n_host the
+/// ensure built (bucket 0 then bucket 1). A CUDA error code, 0 for good; 3: no counters.
 int legion_kv_stats_read(int dev, unsigned long long* ctl, unsigned long long* hist) {
     const auto it = g_ctr.find(dev);
     if (it == g_ctr.end() || it->second.hist == nullptr) return 3;
@@ -140,7 +141,8 @@ int legion_kv_stats_read(int dev, unsigned long long* ctl, unsigned long long* h
     cudaSetDevice(dev);
     bool ok = cudaMemcpy(ctl, it->second.ctl, 16 * sizeof(long long), cudaMemcpyDeviceToHost) ==
                   cudaSuccess &&
-              cudaMemcpy(hist, it->second.hist, (size_t)it->second.n_host * sizeof(long long),
+              cudaMemcpy(hist, it->second.hist,
+                         2 * (size_t)it->second.n_host * sizeof(long long),
                          cudaMemcpyDeviceToHost) == cudaSuccess;
     cudaSetDevice(prev);
     return ok ? 0 : 1;
@@ -154,7 +156,7 @@ void legion_kv_stats_reset(int dev) {
     cudaGetDevice(&prev);
     cudaSetDevice(dev);
     cudaMemset(it->second.ctl, 0, 16 * sizeof(long long));
-    cudaMemset(it->second.hist, 0, (size_t)it->second.n_host * sizeof(long long));
+    cudaMemset(it->second.hist, 0, 2 * (size_t)it->second.n_host * sizeof(long long));
     cudaSetDevice(prev);
 }
 

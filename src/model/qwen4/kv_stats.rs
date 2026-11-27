@@ -134,8 +134,8 @@ pub(crate) struct Snapshot {
 pub(crate) fn snapshot(dev: i32) -> Option<Snapshot> {
     let n = read_n_host(dev)?;
     let mut ctl = [0u64; CTL_BUCKETS * CTL_PER_BUCKET];
-    let mut hist = vec![0u64; n];
-    // SAFETY: plain C buffers, the width the ensure built.
+    let mut hist = vec![0u64; CTL_BUCKETS * n];
+    // SAFETY: plain C buffers, twice the width the ensure built.
     let code = unsafe { legion_kv_stats_read(dev, ctl.as_mut_ptr(), hist.as_mut_ptr()) };
     if code != 0 {
         return None;
@@ -156,23 +156,28 @@ fn read_n_host(dev: i32) -> Option<usize> {
     n_hosts().lock().unwrap().get(&dev).copied()
 }
 
-/// The summary one log line carries: per bucket, the rows, the cells the link does and does
-/// not carry today, the fetches a slot pool would move, and the share of them the top S
-/// blocks already cover (the cache's benefit upper bound at that size).
+/// The summary one log line carries, per bucket on its own: the rows, the cells the link
+/// does and does not carry today, the fetches a slot pool would move, and the share of
+/// them the top S blocks of that bucket's own histogram already cover (the cache's benefit
+/// upper bound at that size).
 #[cfg(feature = "cuda")]
 pub(crate) fn report(dev: i32, s: &Snapshot) {
-    let mut sorted: Vec<u64> = s.hist.iter().copied().filter(|c| *c > 0).collect();
-    sorted.sort_unstable_by(|a, b| b.cmp(a));
-    let fetches: u64 = sorted.iter().sum();
-    let cover = |slots: usize| -> u64 {
-        let top: u64 = sorted.iter().take(slots).sum();
-        if fetches == 0 { 0 } else { top * 100 / fetches }
-    };
-    for (b, name) in [(0usize, "decode"), (8usize, "prompt")] {
-        let (local, host, fetch, rows) = (s.ctl[b], s.ctl[b + 1], s.ctl[b + 2], s.ctl[b + 3]);
+    let width = s.hist.len() / CTL_BUCKETS;
+    for (b, name) in [(0usize, "decode"), (1usize, "prompt")] {
+        let (local, host, fetch, rows) =
+            (s.ctl[b * CTL_PER_BUCKET], s.ctl[b * CTL_PER_BUCKET + 1],
+             s.ctl[b * CTL_PER_BUCKET + 2], s.ctl[b * CTL_PER_BUCKET + 3]);
         if rows == 0 {
             continue;
         }
+        let mut sorted: Vec<u64> =
+            s.hist[b * width..(b + 1) * width].iter().copied().filter(|c| *c > 0).collect();
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        let fetches: u64 = sorted.iter().sum();
+        let cover = |slots: usize| -> u64 {
+            let top: u64 = sorted.iter().take(slots).sum();
+            if fetches == 0 { 0 } else { top * 100 / fetches }
+        };
         tracing::info!(
             dev,
             bucket = name,
