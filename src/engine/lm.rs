@@ -6126,7 +6126,10 @@ impl LmEngine {
             kv_blocks_total: exec
                 .kv_slot_host_budget()
                 .map_or(n_blocks, |held| lazy_slot_cap(held, max_seqs).min(n_blocks))
-                as u32,
+                // The reserved window is not allocatable capacity: the usage bar shows
+                // what sequences can use, not the cache's slots (used = total - free
+                // would otherwise count the window as "in use" from the first step).
+                .saturating_sub(kv_slots) as u32,
             expert_cache_slots: expert_stats.as_ref().map_or(0, |s| s.slots as u32),
             expert_cache_layers: expert_stats.as_ref().map_or(0, |s| s.layers as u32),
             ..Default::default()
