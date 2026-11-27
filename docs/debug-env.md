@@ -186,6 +186,7 @@ runs; unless a row says so, output does not change.
 | `LEGION_TINY=1` | The ignored sparse-attention GPU tests: smallest cases only (for compute-sanitizer runs). |
 | `LEGION_TEST_DS41_HF=<dir>` | The ignored `released_token_map` test: the DeepSeek-V4.1-Flash directory holding the checkpoint's `tokenizer.json`, whose Engram token map is compared with the released GGUF's. |
 | `LEGION_TEST_PAIR_*`, `LEGION_TEST_HC_*` | Model, text and sizes of the ignored KL measurements in `src/engine/lm/tests/` (see their file headers). |
+| `LEGION_DEBUG_KV_STATS=1` | The KV slot cache's Phase 0 measurement (docs/kv-streaming-porting-notes.md): on a pool with a host tier (`--kv-host-tokens`, a discrete GPU whose context does not fit its memory), an extra graph node between the QSA selection and the attention counts where the selections land — per host block, the distinct fetches a step would cause, plus decode and prompt totals (rows, cells the link carries, fetches). A thread logs the summary every 30 s, including the share of the fetches the 1K/8K hottest blocks already cover: the upper bound a slot cache of that size removes. It reads the rows and the block tables and writes nothing the model reads: output is the same bits with it on or off. Off: no node, no counters. |
 
 ## Build time
 

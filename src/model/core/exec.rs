@@ -1230,6 +1230,15 @@ impl Executor {
             s.kv = KvPool::new_ring(hp, buft, 1, &[], None, types)?;
             s.kv = KvPool::new_tiered(hp, buft, n_blocks, &attn, ring, types, tier)?;
             s.kv.set_slot_blocks(self.kv_slot_blocks);
+            // The slot cache's Phase 0 measurement (docs/kv-streaming-porting-notes.md):
+            // where the new pool's host tier starts, so its selection counters know the
+            // boundary. A no-op unless `LEGION_DEBUG_KV_STATS=1`; the spilled pools
+            // (`--kv-memory`) are not the discrete-GPU tiers this measures.
+            if s.kv_spill.is_none() {
+                if let Some(t) = tier {
+                    crate::model::qwen4::kv_stats::register(t.device, n_blocks, t.hbm_blocks);
+                }
+            }
         }
         self.mtp_decode.clear();
         self.mtp_mixed.clear();
