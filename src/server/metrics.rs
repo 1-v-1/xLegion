@@ -72,6 +72,9 @@ pub struct Metrics {
     waiting_by_priority: Family<PriorityLabels, Gauge>,
     waiting_keys: Gauge,
     kv_blocks_used: Gauge,
+    kv_slot_hits: Gauge,
+    kv_slot_misses: Gauge,
+    kv_slot_window: Gauge,
     kv_blocks_total: Gauge,
     prefix_cache_hit_tokens: Gauge,
     kv_preemptions: Gauge,
@@ -174,6 +177,21 @@ impl Metrics {
             &mut registry,
             "legion_engine_kv_blocks_used",
             "KV cache blocks in use",
+        );
+        let kv_slot_hits = gauge(
+            &mut registry,
+            "legion_engine_kv_slot_hits",
+            "Selections the KV slot cache served from its VRAM window (cumulative)",
+        );
+        let kv_slot_misses = gauge(
+            &mut registry,
+            "legion_engine_kv_slot_misses",
+            "Selections that reached the KV host tier past the slot window (cumulative)",
+        );
+        let kv_slot_window = gauge(
+            &mut registry,
+            "legion_engine_kv_slot_window_blocks",
+            "KV slot cache window in blocks, 0: off",
         );
         let kv_blocks_total = gauge(
             &mut registry,
@@ -326,6 +344,9 @@ impl Metrics {
             waiting_keys,
             kv_blocks_used,
             kv_blocks_total,
+            kv_slot_hits,
+            kv_slot_misses,
+            kv_slot_window,
             prefix_cache_hit_tokens,
             kv_preemptions,
             spec_draft_tokens,
@@ -402,6 +423,9 @@ impl Metrics {
         }
         self.waiting_keys.set(stats.waiting_keys.into());
         self.kv_blocks_used.set(stats.kv_blocks_used.into());
+        self.kv_slot_hits.set(stats.kv_slot_hits as i64);
+        self.kv_slot_misses.set(stats.kv_slot_misses as i64);
+        self.kv_slot_window.set(stats.kv_slot_window.into());
         self.kv_blocks_total.set(stats.kv_blocks_total.into());
         self.prefix_cache_hit_tokens
             .set(stats.prefix_cache_hit_tokens as i64);

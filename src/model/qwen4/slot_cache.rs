@@ -466,6 +466,34 @@ pub(crate) fn window_blocks() -> Option<usize> {
 /// a couple of thousand blocks. `docs/kv-streaming-porting-notes.md` §4.7.
 pub(crate) const DEFAULT_WINDOW_BLOCKS: usize = 2048;
 
+/// The window of the registered state, 0: off (the stats snapshot's question).
+pub(crate) fn window() -> usize {
+    WINDOW.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static WINDOW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The cache's counters (hits, misses, evictions), summed over the registered devices.
+/// Reads the resolve kernel's mirrored copy: plain memory, safe on any thread and never
+/// a CUDA synchronization; values lag a replay by design (a display gauge).
+#[cfg(feature = "cuda")]
+pub(crate) fn read_counters() -> (u64, u64, u64) {
+    if !ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        return (0, 0, 0);
+    }
+    let mut out = [0u64; 6];
+    let mut sum = [0u64; 3];
+    for &dev in registered().lock().unwrap().iter() {
+        // SAFETY: plain C, `out` is 6 u64s.
+        if unsafe { legion_kv_slots_read(dev as i32, out.as_mut_ptr()) } == 0 {
+            sum[0] += out[0];
+            sum[1] += out[1];
+            sum[2] += out[3];
+        }
+    }
+    (sum[0], sum[1], sum[2])
+}
+
 /// The devices with a built slot state (kept host-side so the graph builder can gate).
 #[cfg(feature = "cuda")]
 fn registered() -> &'static std::sync::Mutex<Vec<usize>> {
@@ -503,12 +531,30 @@ pub(crate) fn register(device: usize, w: usize, n_blocks: usize, cell_space: usi
     // (§4.10.6). Idempotent; every pool's free path then reaches the release queue.
     crate::kv::BlockPool::set_free_observer(release);
     ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+    WINDOW.store(w, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Whether any pool registered a slot state (set once, read on the release path and by no
 /// hot loop).
 #[cfg(feature = "cuda")]
 static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a slot state exists on any device (the stats poll's gate).
+#[cfg(feature = "cuda")]
+pub(crate) fn active() -> bool {
+    ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// No host tier, no slot state on the CPU (mirrors `node` never building the op there).
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn active() -> bool {
+    false
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn read_counters() -> (u64, u64, u64) {
+    (0, 0, 0)
+}
 
 /// The engine's release hook: a block the allocator freed loses its slot (§4.10.6). With
 /// the mechanism off this is one relaxed load on the allocator's path.

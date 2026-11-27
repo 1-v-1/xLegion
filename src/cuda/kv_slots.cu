@@ -39,6 +39,7 @@ struct Seg {
 struct ReleaseRing {
     volatile unsigned long long produce;
     volatile unsigned long long consumed;
+    volatile unsigned long long ctl_mirror[6]; // = N_CTL, mirrored by the resolve kernel
     static const int R = 1 << 16;
     volatile int ids[R];
 };
@@ -213,6 +214,9 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
         int b = s.copy_list[i].x;
         if (b >= 0 && b < s.n_blocks) s.claimed_mark[b] = 0;
     }
+    // Mirror the counters for the host's stats poll (see ReleaseRing::ctl_mirror).
+    if (tid == 0)
+        for (int i = 0; i < N_CTL; i++) s.ring->ctl_mirror[i] = s.ctl[i];
 }
 
 /// One CTA moves `copy_stride` bytes of one claimed block across all segments (a loop: the
@@ -323,12 +327,10 @@ void legion_kv_slots_graph(const int* sel, long long sel_nb1, int* tab, long lon
 int legion_kv_slots_read(int dev, unsigned long long* ctl) {
     const auto it = g_slots.find(dev);
     if (it == g_slots.end()) return 3;
-    int prev;
-    cudaGetDevice(&prev);
-    cudaSetDevice(dev);
-    bool ok = cudaMemcpy(ctl, it->second.ctl, N_CTL * 8, cudaMemcpyDeviceToHost) == cudaSuccess;
-    cudaSetDevice(prev);
-    return ok ? 0 : 1;
+    // The kernel-mirrored copy: plain memory, no CUDA sync (safe on any thread).
+    const volatile unsigned long long* m = it->second.ring->ctl_mirror;
+    for (int i = 0; i < N_CTL; i++) ctl[i] = m[i];
+    return 0;
 }
 
 }  // extern "C"

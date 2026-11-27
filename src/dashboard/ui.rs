@@ -1377,7 +1377,7 @@ pub fn draw_kv(f: &mut Frame, area: Rect, app: &App) {
         let all = e.prompt_tokens + e.prefix_cache_hit_tokens;
         (all > 0).then(|| e.prefix_cache_hit_tokens as f64 * 100.0 / all as f64)
     };
-    let lines = vec![
+    let mut lines = vec![
         Line::raw(format!(
             "VRAM {} tok  host {} tok",
             tokens(h.kv_device_tokens),
@@ -1399,6 +1399,19 @@ pub fn draw_kv(f: &mut Frame, area: Rect, app: &App) {
             h.kv_types.as_deref().unwrap_or("n/a")
         )),
     ];
+    if e.kv_slot_window > 0 {
+        // The KV slot cache (docs/kv-streaming-porting-notes.md §4.7): the window's token
+        // span (1 block = 64 positions) and the share of selections it served from VRAM.
+        let asked = e.kv_slot_hits + e.kv_slot_misses;
+        let slot_hit = (asked > 0).then(|| e.kv_slot_hits as f64 * 100.0 / asked as f64);
+        lines.push(Line::raw(format!(
+            "slot win {} tok  hits {} ({}/{})",
+            tokens(e.kv_slot_window as u64 * 64),
+            pct(slot_hit),
+            e.kv_slot_hits,
+            asked
+        )));
+    }
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 

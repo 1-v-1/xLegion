@@ -69,6 +69,11 @@ pub struct EngineSnap {
     pub generated_tokens: u64,
     pub kv_blocks_used: u32,
     pub kv_blocks_total: u32,
+    /// The KV slot cache (§4.7): the window in blocks (0: off) and its read cache's
+    /// cumulative served / asked-host / reused-slot counts.
+    pub kv_slot_window: u32,
+    pub kv_slot_hits: u64,
+    pub kv_slot_misses: u64,
     pub prefix_cache_hit_tokens: u64,
     pub expert_cache_hits: u64,
     pub expert_cache_misses: u64,

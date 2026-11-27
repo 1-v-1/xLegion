@@ -306,6 +306,13 @@ pub struct EngineStats {
     pub generated_tokens: u64,
     pub kv_blocks_used: u32,
     pub kv_blocks_total: u32,
+    /// The KV slot cache (docs/kv-streaming-porting-notes.md §4.7): the window in blocks
+    /// (0: off), and the read cache's cumulative selections it served from VRAM vs the
+    /// host reads those selections still made, and slots it reused.
+    pub kv_slot_window: u32,
+    pub kv_slot_hits: u64,
+    pub kv_slot_misses: u64,
+    pub kv_slot_evictions: u64,
     /// Routed expert selections served by resident slots or the host tier.
     pub expert_cache_hits: u64,
     pub expert_cache_misses: u64,
