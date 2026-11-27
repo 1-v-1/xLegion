@@ -447,11 +447,12 @@ pub struct Seg {
     pub(crate) bytes: usize,
 }
 
-/// The window the measurement opt-in asks for (`LEGION_DEBUG_KV_SLOTS=<blocks>`); `None`
-/// (the default) leaves the mechanism off. Phase 1 develops and A/B-tests behind this
-/// switch; §4.7's auto-on + `--no-kv-slot-cache` lands after the A/B on the target
-/// machines says so.
-pub(crate) fn configured() -> Option<usize> {
+/// The window width from `LEGION_DEBUG_KV_SLOTS=<blocks>` (the A/B / tuning override of
+/// §5.4): `Some(w)` to pin a specific width, `None` to use the caller's automatic default.
+/// Enabling is not here - the mechanism is automatic per §4.7 (a sparse model over a host
+/// tier with the caches in the in-place types), `--no-kv-slot-cache` off; this only sizes
+/// the window when it is on.
+pub(crate) fn window_blocks() -> Option<usize> {
     static W: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *W.get_or_init(|| {
         let v = std::env::var("LEGION_DEBUG_KV_SLOTS").ok()?;
@@ -459,6 +460,11 @@ pub(crate) fn configured() -> Option<usize> {
         (w >= 8).then_some(w)
     })
 }
+
+/// The default window when the mechanism is on and the width is not overridden: sized to
+/// the measured hot set (§5.3 - the 1K hottest blocks carried 93% of decode's fetches),
+/// a couple of thousand blocks. `docs/kv-streaming-porting-notes.md` §4.7.
+pub(crate) const DEFAULT_WINDOW_BLOCKS: usize = 2048;
 
 /// The devices with a built slot state (kept host-side so the graph builder can gate).
 #[cfg(feature = "cuda")]

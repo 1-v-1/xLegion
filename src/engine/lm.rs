@@ -3971,6 +3971,8 @@ struct MemoryPlanFacts<'a> {
     max_seqs: usize,
     /// KV blocks in all.
     n_blocks: usize,
+    /// The KV slot cache's window in blocks, 0: off (§4.7; reported with the context).
+    kv_slot_window: usize,
     kv_lend: Option<&'a kv_vmm::KvLend>,
     /// Per stage: its pools' tail lent to the expert cache at load (empty without a lend).
     kv_lent_bytes: &'a [usize],
@@ -4048,6 +4050,7 @@ fn log_memory_plan(
             max_seqs: f.max_seqs,
             kv_pool_tokens: f.n_blocks * KV_BLOCK,
             kv_host_tier_tokens: report.kv.host_tokens,
+            kv_slot_window_tokens: f.kv_slot_window * KV_BLOCK,
             kv_spill_tokens: plan::spill_tokens(tail_tokens, lent, host.kv_spill_max),
         },
         gpus,
@@ -5435,7 +5438,18 @@ impl LmEngine {
             // the host holds every other block (position B). Phase 1 scope: not with
             // sequence slots, a lent tail or tensor parallelism; a window at or above the
             // VRAM the fit left changes nothing (left off).
-            if let Some(w) = crate::model::qwen4::slot_cache::configured() {
+            // The KV slot cache (docs/kv-streaming-porting-notes.md §4.7): automatic on
+            // exactly where it measured to pay (§5.3) - a model whose sparse kernels read
+            // the caches in place, over a host tier, with the caches in those types.
+            // `--no-kv-slot-cache` turns it off; `LEGION_DEBUG_KV_SLOTS` sizes the window
+            // for the A/B (§5.4), else the default sized to the measured hot set. Scope:
+            // no sequence slots, no lent tail, no tensor parallelism (Phase 1).
+            let auto = !cfg.switches.kv_slot_cache.is_some_and(|on| !on)
+                && crate::model::qwen4::qsa_attn::reads_types(cfg.cache_types)
+                && (0..hp.n_layer).any(|il| hp.arch.indexed(il));
+            if auto {
+                let w = crate::model::qwen4::slot_cache::window_blocks()
+                    .unwrap_or(crate::model::qwen4::slot_cache::DEFAULT_WINDOW_BLOCKS);
                 let conflicts =
                     exec.kv_slot_blocks() > 0 || cfg.switches.kv_vmm_keep.is_some() || cfg.tp > 1;
                 if host_tokens > 0 && !conflicts && w + 64 < hbm_blocks {
@@ -6096,6 +6110,7 @@ impl LmEngine {
                 ctx_size: cfg.ctx_size,
                 max_seqs,
                 n_blocks,
+                kv_slot_window: kv_slots,
                 kv_lend: kv_lend.as_ref(),
                 kv_lent_bytes: &kv_lent_bytes,
                 planned_compute: &planned_compute,

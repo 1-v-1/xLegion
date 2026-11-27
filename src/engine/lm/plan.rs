@@ -107,6 +107,8 @@ pub(super) struct ContextPlan {
     pub max_seqs: usize,
     pub kv_pool_tokens: usize,
     pub kv_host_tier_tokens: usize,
+    /// The KV slot cache's window in tokens when it is on, 0: off (docs §4.7).
+    pub kv_slot_window_tokens: usize,
     /// Tokens of a lent tail whose KV host memory can keep ([`spill_tokens`]).
     pub kv_spill_tokens: usize,
 }
@@ -227,6 +229,15 @@ pub(super) fn log(p: &MemoryPlan) {
         kv_spill_tokens = c.kv_spill_tokens,
         "memory plan"
     );
+    if c.kv_slot_window_tokens > 0 {
+        // The KV slot cache is on (docs/kv-streaming-porting-notes.md §4.7): this part of
+        // the tier's blocks has a demand-paged VRAM copy the steps read instead of the link.
+        tracing::info!(
+            part = "kv slot window",
+            window_tokens = c.kv_slot_window_tokens,
+            "memory plan"
+        );
+    }
     for g in &p.gpus {
         tracing::info!(
             part = %g.device,

@@ -318,6 +318,14 @@ pub struct Switches {
     /// ([`crate::model::core::expert_mv::peer::set_enabled`]); `None`: the automatic choice
     /// ([`crate::model::core::expert_mv::peer::auto`]).
     pub expert_peer_fetch: Option<bool>,
+    /// The KV slot cache over the KV host tier (docs/kv-streaming-porting-notes.md): the
+    /// pool's first blocks are a VRAM slot window no sequence is allocated, the host holds
+    /// every other block, and the blocks a sparse-attention step selects are pulled in on
+    /// demand behind a second-chance clock, the block table re-pointed inside the graph.
+    /// None: automatic - on exactly where it measured to pay (a model whose sparse kernels
+    /// read the caches in place over a host tier with the caches in those types, §5.3).
+    /// Some(false): off (`--no-kv-slot-cache`), the same output bits either way.
+    pub kv_slot_cache: Option<bool>,
     /// The peer's share of a layer's missed experts
     /// ([`crate::model::core::expert_mv::peer::set_share`]).
     pub expert_peer_share: Option<crate::model::core::expert_mv::peer::Share>,
