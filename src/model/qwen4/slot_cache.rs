@@ -1,8 +1,7 @@
 //! The KV slot cache's state model: the residency arrays and the per-step resolve
 //! ([`SlotState::resolve_step`]). The design and why: docs/kv-streaming-porting-notes.md
 //! §4.10, and the measured basis: §5.3 (42.5% of decode's selected cells read the KV host
-//! tier; the 1K hottest blocks carry 93% of the fetches).
-//!
+//! tier; the 1K hottest blocks carry 93% of the fetches).//!
 //! Position B: on a pool with a host tier, the pool's first `w` block ids are the slot
 //! window (VRAM, reserved out of allocation with [`crate::kv::BlockPool::reserve`]); every
 //! block a sequence holds is a host-backed identity id. A slot is a copy of one block whose
@@ -434,4 +433,183 @@ mod tests {
             }
         }
     }
+}
+
+// ---- runtime: the registered pools and the graph hook (the CUDA body: src/cuda/kv_slots.cu) ----
+
+/// One copy segment as the CUDA registry takes it: a pool tensor's base and one block's
+/// bytes in it. `KvPool::pool_segments` collects them for a tiered pool.
+#[cfg(feature = "cuda")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Seg {
+    base: u64,
+    bytes: u64,
+}
+
+/// The window the measurement opt-in asks for (`LEGION_DEBUG_KV_SLOTS=<blocks>`); `None`
+/// (the default) leaves the mechanism off. Phase 1 develops and A/B-tests behind this
+/// switch; §4.7's auto-on + `--no-kv-slot-cache` lands after the A/B on the target
+/// machines says so.
+pub(crate) fn configured() -> Option<usize> {
+    static W: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        let v = std::env::var("LEGION_DEBUG_KV_SLOTS").ok()?;
+        let w: usize = v.trim().parse().ok()?;
+        (w >= 8).then_some(w)
+    })
+}
+
+/// The devices with a built slot state (kept host-side so the graph builder can gate).
+#[cfg(feature = "cuda")]
+fn registered() -> &'static std::sync::Mutex<Vec<usize>> {
+    static R: std::sync::OnceLock<std::sync::Mutex<Vec<usize>>> = std::sync::OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
+/// Build device `device`'s slot state for a pool of `n_blocks` blocks whose first `w` are
+/// the reserved window, over `segments` (every tiered attention layer's K and V). Called
+/// where the pool's tier is built; a rebuild replaces the state (the ids moved).
+#[cfg(feature = "cuda")]
+pub(crate) fn register(device: usize, w: usize, n_blocks: usize, cell_space: usize, segments: &[Seg]) {
+    // SAFETY: plain C; `segments` outlives the call.
+    let code = unsafe {
+        legion_kv_slots_ensure(
+            device as i32,
+            w as i64,
+            n_blocks as i64,
+            cell_space as i64,
+            segments.as_ptr(),
+            segments.len() as i32,
+            (n_blocks).min(8192).max(w) as i32,
+        )
+    };
+    if code != 0 {
+        tracing::warn!(device, "kv slots: cannot build the cache state (error {code})");
+        return;
+    }
+    let mut r = registered().lock().unwrap();
+    if !r.contains(&device) {
+        r.push(device);
+    }
+    ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether any pool registered a slot state (set once, read on the release path and by no
+/// hot loop).
+#[cfg(feature = "cuda")]
+static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The engine's release hook: a block the allocator freed loses its slot (§4.10.6). With
+/// the mechanism off this is one relaxed load on the allocator's path.
+pub(crate) fn release(_id: u32) {
+    #[cfg(feature = "cuda")]
+    if ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        // SAFETY: plain C.
+        unsafe { legion_kv_slots_release(_id as i32) };
+    }
+}
+
+/// The per-step resolve node, built between the selection and the attention it feeds
+/// (`sparse_paged`): reads the selection rows and positions, rewrites the block table in
+/// place and pulls the claimed blocks host -> slot. `None` (no node, an untouched graph)
+/// unless the device's state is built. A device-only op: on the CPU there is no host
+/// tier, no registration, and the body is a pass-through kept for the op contract.
+#[cfg(feature = "cuda")]
+pub(crate) fn node<'a>(
+    ctx: &'a crate::ggml::Context,
+    k: crate::ggml::Tensor<'_>,
+    sel: crate::ggml::Tensor<'a>,
+    table: crate::ggml::Tensor<'a>,
+    pos: crate::ggml::Tensor<'a>,
+) -> Option<crate::ggml::Tensor<'a>> {
+    let dev = k.cuda_device()?;
+    if !registered().lock().unwrap().contains(&dev) {
+        return None;
+    }
+    Some(ctx.external_with(
+        &KV_SLOTS,
+        crate::ggml::types::I8,
+        [1, 1, 1, 1],
+        &[sel, table, pos],
+        &[dev as i32 + 1],
+    ))
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn node<'a>(
+    _ctx: &'a crate::ggml::Context,
+    _k: crate::ggml::Tensor<'_>,
+    _sel: crate::ggml::Tensor<'a>,
+    _table: crate::ggml::Tensor<'a>,
+    _pos: crate::ggml::Tensor<'a>,
+) -> Option<crate::ggml::Tensor<'a>> {
+    None
+}
+
+#[cfg(feature = "cuda")]
+static KV_SLOTS: crate::ggml::ExternalOp = crate::ggml::ExternalOp {
+    name: "qsa_kv_slots",
+    cpu: cpu_slots,
+    cuda: Some(cuda_slots),
+};
+
+/// The CPU body: a pass-through. There is no host tier and no state on the CPU, and
+/// `node` never built this op there; the walk itself is [`SlotState::resolve_step`],
+/// tested above and mirrored by the CUDA kernel.
+#[cfg(feature = "cuda")]
+unsafe fn cpu_slots(_dst: &crate::ggml::ffi::ggml_tensor, _ith: usize, _nth: usize) {}
+
+#[cfg(feature = "cuda")]
+unsafe fn cuda_slots(
+    dst: &crate::ggml::ffi::ggml_tensor,
+    stream: *mut std::os::raw::c_void,
+) -> Result<(), String> {
+    // SAFETY: a node made by `node`: the attention node's own device operands.
+    unsafe {
+        let (sel_t, tab_t, pos_t) = (&*dst.src[0], &*dst.src[1], &*dst.src[2]);
+        let p = crate::ggml::external_params(dst);
+        let rows = sel_t.ne[1];
+        let n_seqs = tab_t.ne[1].max(1);
+        legion_kv_slots_graph(
+            sel_t.data as *const i32,
+            sel_t.nb[1] / 4,
+            tab_t.data as *mut i32,
+            tab_t.nb[1] / 4,
+            pos_t.data as *const i32,
+            rows as i32,
+            (rows / n_seqs).max(1) as i32,
+            p[0] - 1,
+            stream,
+        );
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
+unsafe extern "C" {
+    /// Builds the device's slot state; see [`register`].
+    fn legion_kv_slots_ensure(
+        dev: i32,
+        w: i64,
+        n_blocks: i64,
+        cell_space: i64,
+        segs: *const Seg,
+        n_segs: i32,
+        copy_max: i32,
+    ) -> i32;
+    /// The resolve and the copy, on the attention call's stream.
+    fn legion_kv_slots_graph(
+        sel: *const i32,
+        sel_nb1: i64,
+        tab: *mut i32,
+        tab_nb1: i64,
+        pos: *const i32,
+        rows: i32,
+        n_tok: i32,
+        dev: i32,
+        stream: *mut std::os::raw::c_void,
+    );
+    /// A freed block's slot dies.
+    fn legion_kv_slots_release(id: i32);
 }

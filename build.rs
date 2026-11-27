@@ -282,6 +282,7 @@ fn build_cuda_kernels(ggml: &Path) {
         .file("src/cuda/shim.cu")
         .file("src/cuda/qsa_attn.cu")
         .file("src/cuda/kv_stats.cu")
+        .file("src/cuda/kv_slots.cu")
         .file("src/cuda/moe_gemm.cu")
         .file("src/cuda/qwen4_hc.cu")
         .file("src/cuda/cvec.cu")
