@@ -147,9 +147,62 @@ Strata 的 +6%/+23% 数字包含"KV 出 VRAM → expert slots 变多"的收益�
 
 ## 5. 分期与决策点
 
-- **Phase 0 — 测量，先于一切实现**：在 QSA decode 插桩：每步选中块中 host 区块的块数/字节数、以及相邻步的重复命中块数（决定缓存理论上限）。跑 4090（C=1/4，8K-128K）与 AC922（C=4，40K）。产出：收益上界估计（`1 - 上界时延占比`）。**Go/No-Go 决策放这里**——若选中块基本不落 host 区，或重复率极低，不做 G1-G4。
-- **Phase 1 — 最小闭环**：G1-G4 + parity + `--kv-paging off` 默认；qwen4exp + q8_0/q4_0；单 stage、无 TP。验收 = parity + 4090/AC922 实测表。
-- **Phase 2 — 策略与整合**：auto 规则进 memory plan；metrics/report；多序列共享 slot 去重；与 `--kv-vmm-keep`、`--kv-admission on-demand` 的组合语义。
+- **Phase 0 — 测量，先于一切实现**：插桩已实现（`LEGION_DEBUG_KV_STATS=1`，
+  src/model/qwen4/kv_stats.rs + src/cuda/kv_stats.cu，挂在 attention 的 `after_attn`，
+  与 `sel_dump` 同形；不建图节点，位级不动）。runbook 见 §5.1，Go/No-Go 判定见 §5.2。
+- **Phase 1 — 最小闭环**：G1-G4 + parity；qwen4exp + q8_0/q4_0；机制随 host tier 自动
+  生效，唯一开关 `--no-kv-slot-cache`（§4.7）；单 stage、无 TP。验收 = parity +
+  4090/AC922 实测表。
+- **Phase 2 — 策略与整合**：auto 规则进 memory plan；metrics/report；多序列共享 slot 去重；
+  与 `--kv-vmm-keep`、`--kv-admission on-demand` 的组合语义。
+
+### 5.1 Phase 0 runbook
+
+前提：KV host tier 要真的出现（`--kv-host-tokens` 自动档 = 上下文超出该卡 KV 能拿到的
+VRAM）。启动日志的 memory plan 里应看到 `kv host tier` 行；没有这行 = 场景不对，计数
+器不会注册。
+
+RTX 4090（24 GB，PCIe，1×4090 游戏机；基于 docs/run/gaming-pc 的命令，两处上下文）：
+
+```sh
+# 场景 1: C=1 长上下文，制造并压测 host tier
+LEGION_DEBUG_KV_STATS=1 legion serve \
+  --model Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+  --device cuda --max-seqs 1 --ctx-size 131072 --prefix-cache-states 0 --ngram-io direct
+# 场景 2: 文档原配置（C=4, 40K），看多序列下 KV 是否溢出到 host
+LEGION_DEBUG_KV_STATS=1 legion serve \
+  --model Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+  --device cuda --max-seqs 4 --ctx-size 40960 --prefix-cache-states 0 --ngram-io direct \
+  --cpu-expert-share auto --spec mtp --spec-draft mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf --spec-k 1
+```
+
+跑法：发若干深对话（场景 1 至少一条把上下文推到 64K+ 的长会话；`legion bench` 长 prompt
++ 长输出亦可），每 30 s 出一条 `kv stats:` 日志，记录 ≥10 分钟到稳态。
+
+AC922 4×V100（16 GB，NVLink，40K ctx 即触发 host tier；用 docs/run/ac922 对应模型的命令
+前加 `LEGION_DEBUG_KV_STATS=1`，C=1 与 C=4 各一轮）。
+
+日志判读（每 bucket 一条，decode=解码/验证步，prompt=预填充）：
+
+```
+kv stats: decode steps read <host> of <total> selected cells from host blocks
+          (<fetch> block fetches, <unique> unique; a 1K-slot window would carry X%, 8K: Y%)
+```
+
+### 5.2 Go/No-Go 与姿态判定
+
+- `cells_host / total ≈ 0`：选中基本不落 host → **No-Go**（特性在真实配置里不触发，保持
+  计数器关闭即可）。
+- `cells_host` 占比可观，且 `X%（1K 窗覆盖度）` 高（粗参考 ≥70%）：slot 缓存能吃掉大
+  部分链路读 → **Go**。选姿态：若同机 expert cache 已把 VRAM 吃紧（memory plan 显示
+  expert slots 随 KV 收缩明显受益）→ **姿态 B**（窗口收到工作集，KV 让位 expert）；
+  否则 **姿态 A**（吃现有窗，纯链路折减）。
+- 占比可观但覆盖度低（选择高度分散、近似一次性命中）：slot 池救不了多少 → 缓行，
+  只保留计数器进 `/metrics` 观察。
+- 辅助核对：`fetch ≈ 稳态增速 × unique`；`unique/rows` 持续增长 = 选择无复用。
+- 顺带验收位级不动：同请求开/关 `LEGION_DEBUG_KV_STATS` 贪心输出逐字节一致。
+
+
 
 ## 6. 开放问题
 
