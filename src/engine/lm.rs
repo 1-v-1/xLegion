@@ -5433,11 +5433,6 @@ impl LmEngine {
                     host_blocks = host_blocks.min((tier_most_tokens / KV_BLOCK).max(sized));
                 }
             }
-            // The KV slot cache (docs/kv-streaming-porting-notes.md §4.10): with a window
-            // configured over a tiered pool, the pool's VRAM range becomes the window and
-            // the host holds every other block (position B). Phase 1 scope: not with
-            // sequence slots, a lent tail or tensor parallelism; a window at or above the
-            // VRAM the fit left changes nothing (left off).
             // The KV slot cache (docs/kv-streaming-porting-notes.md §4.7): automatic on
             // exactly where it measured to pay (§5.3) - a model whose sparse kernels read
             // the caches in place, over a host tier, with the caches in those types.
@@ -5453,8 +5448,12 @@ impl LmEngine {
                 let conflicts =
                     exec.kv_slot_blocks() > 0 || cfg.switches.kv_vmm_keep.is_some() || cfg.tp > 1;
                 if host_tokens > 0 && !conflicts && w + 64 < hbm_blocks {
+                    // Position B redistributes, it does not resize: the host takes every
+                    // block the VRAM window gives up - the pool's total capacity (and the
+                    // block tables' width, capped by it) stays what the fit and the tier
+                    // sized, exactly what a context of the full length needs (§4.10).
                     kv_slots = w;
-                    host_blocks = n_blocks - w;
+                    host_blocks = hbm_blocks + host_blocks - w;
                     hbm_blocks = w;
                 }
             }
