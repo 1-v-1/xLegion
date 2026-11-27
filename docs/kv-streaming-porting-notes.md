@@ -143,6 +143,39 @@ Strata 的 +6%/+23% 数字包含"KV 出 VRAM → expert slots 变多"的收益�
    - 尺寸 Phase 1 走 debug env（`LEGION_DEBUG_KV_SLOTS`，先例 `LEGION_DEBUG_HOST_MEM_GIB`），auto 值 = 选择工作集下界 `max_seqs × (515/4 + 2)` 块与 KV VRAM 窗的一小部分（下界纯代码可算）；Phase 2 证明需要用户级控制才升为 `--kv-slot-cache-tokens`。
    - `--kv-vmm-keep` 交互取不变量"slot 区间不借出"（v1）。
    - 配套：memory plan 行（`src/engine/lm/plan.rs`）、`/metrics` hit/miss/overflow（Strata `KvStreamCounters` 语义）、`docs/serving.md` 表格一行。
+
+### 4.10 Phase 1 实现设计定稿（2026-11-27，读通池/写路径后）
+
+读 `tiered_rows`/`KvPool::write`/`StepInputs::to_fill` 后的定稿。关键事实：池是一个
+VMM 虚拟范围（块 id < hbm 在 VRAM、≥ hbm 在 host arena，**同一指针**）；attention 的
+block table、KV 写的 `cells`、`pos` 都是**每步由 host 重新填充的图输入**；KV 写走
+`cells`（host 侧按原始 block id 算出），**不经 attention 的表**。由此：
+
+1. **G4（写者双写）取消。** 写恒写 host identity 位；一致性不靠镜像，靠"槽里放着的块
+   不会再被写"（下述 3）。写路径一行不改。
+2. **姿态 B 的边界**：slot 池 = 池虚拟范围的前 W 个块 id（现状天然在 VRAM）。分配隔离：
+   池建好后把块 0..W 永久占住（ref_counts 置 1，永不释放），admission 只会拿到 ≥ W 的
+   id → 全部 host 身份位。驻留图 `residency[block]=slot`、`slot_block[slot]`、
+   `slot_stamp/slot_ref/miss_*/ctl` 一个设备端小数组组（Strata 字段集）。
+3. **resolve 的分页不变量（取代 Strata 的 gap 论证）**：跳过**本步会被写的块**——每序列
+   `[pos_s/64 .. (pos_s+n_s−1)/64]` 经其表取出的块 id（含验证/草稿的越尾写）。归纳论证：
+   块一旦不在某步的写集内，append-only 序列与拒绝草稿（只写 >end 位置）都不会再写它 →
+   槽内容恒等于 host。反面保护跨层一致性：本步任何层写过（或将写）的块都不 promote，
+   所以被 promote 的块各层数据都已稳定，整块跨层拷贝无撕裂；这些块下一步起不再是写集，
+   那时才进缓存。prompt 步里同一步的读不受影响——读经 host identity（未重指向）或已
+   稳定块的正确槽。**不需要尾块 gap**。
+4. **promote 是全块跨层**：一个块 id 在每层 (K,V) 池里索引同位。copy kernel 按层基指针
+   设备数组循环（K、V 各一张），一次 miss 拷 `n_qsa_layers × 块字节`——与"槽=块的完整
+   副本"语义一致，避免逐层驻留的不一致状态。
+5. **表的槽空间/身份空间**：resolve 重指向共享 table 张量后，后续层的 resolve 读到
+   `entry < W` 即"已驻留"（经 `slot_block[entry]` 反查），天然幂等、跨层复用。每步 host
+   重新上传原始 id 的表 → 步间无需持久重指向。
+6. **释放失效队列**：块被 radix 释放/回收时其槽作废。host 把释放 id 写进 pinned 环形
+   队列（单调计数在设备端记消费位），每步 resolve 先排空（清 `residency[id]`）；同一
+   步内重新 promote 会重拷当前 host 内容，正确。
+7. **表上传即真值**：任何时刻"表项 → 实际读到的字节"要么 host identity、要么内容与 host
+   相等的槽——正确性不依赖读方是谁、哪层。
+
 8. **测试**：移植 parity 测试形态（合成选择形状：整块 + 阈值残块 + 尾块 + 半近期，双跑逐位相等 + 驻留图一致 + 计数自洽，Strata `kv_stream_parity.cpp`）；Legion 侧加现有 `--deterministic` 同文本对拍（开/关逐字节一致是本仓库的既有验收线，如 `--expert-peer-fetch` 行，`docs/serving.md:178`）。
 
 ## 5. 分期与决策点
