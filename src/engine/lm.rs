@@ -5447,7 +5447,22 @@ impl LmEngine {
                     .unwrap_or(crate::model::qwen4::slot_cache::DEFAULT_WINDOW_BLOCKS);
                 let conflicts =
                     exec.kv_slot_blocks() > 0 || cfg.switches.kv_vmm_keep.is_some() || cfg.tp > 1;
-                if host_tokens > 0 && !conflicts && w + 64 < hbm_blocks {
+                if host_tokens == 0 {
+                    tracing::info!("kv slot cache: off (no host tier: every block is already in device memory)");
+                } else if conflicts {
+                    tracing::info!(
+                        slots = exec.kv_slot_blocks() > 0,
+                        vmm_keep = cfg.switches.kv_vmm_keep.is_some(),
+                        tp = cfg.tp > 1,
+                        "kv slot cache: off (out of Phase 1 scope: --kv-slots / --kv-vmm-keep / --tp)"
+                    );
+                } else if w + 64 >= hbm_blocks {
+                    tracing::info!(
+                        window_blocks = w,
+                        device_blocks = hbm_blocks,
+                        "kv slot cache: off (the window would not be smaller than the VRAM range)"
+                    );
+                } else {
                     // Position B redistributes, it does not resize: the host takes every
                     // block the VRAM window gives up - the pool's total capacity (and the
                     // block tables' width, capped by it) stays what the fit and the tier
