@@ -539,6 +539,12 @@ pub struct Executor {
     mtp_spare: Option<ComputeAllocator>,
     /// Paged attention's block-table width: the most blocks one sequence can have.
     max_seq_blocks: usize,
+    /// The KV slot cache's window, in blocks (0: off; docs/kv-streaming-porting-notes.md
+    /// §4.10). With it on, each stage's pool registers its state on the next
+    /// [`Self::resize_kv`].
+    kv_slots: usize,
+    /// The sequence count the slot cache sizes its table-cell mark array for.
+    kv_slots_seqs: usize,
     /// Layers whose outputs every step returns ([`Self::capture_hidden`]).
     hidden: Vec<usize>,
     /// A captured-rows vector handed back for the next step's copy ([`Self::recycle_rows`]).
@@ -889,6 +895,8 @@ impl Executor {
             par_mtp: Vec::new(),
             mtp_spare: None,
             max_seq_blocks: kv_blocks.max(1),
+            kv_slots: 0,
+            kv_slots_seqs: 0,
             hidden: Vec::new(),
             spare_rows: rows_out::Spare::default(),
             mtp_kv: None,
@@ -1264,7 +1272,52 @@ impl Executor {
             )?);
         }
         self.max_seq_blocks = self.max_seq_blocks.clamp(1, n_blocks.max(1));
+        // The KV slot cache (§4.10): each stage whose pool has a tier registers its state
+        // over the window. A rebuild re-registers (the ids moved; the CUDA state resets).
+        #[cfg(feature = "cuda")]
+        if self.kv_slots > 0 {
+            let cell_space = (self.max_seq_blocks + 1) * self.kv_slots_seqs.max(1);
+            for (si, s) in self.stages.iter().enumerate() {
+                let Some(t) = self.kv_tiers.get(si).copied().flatten() else {
+                    continue;
+                };
+                if s.kv_spill.is_some() {
+                    continue;
+                }
+                let mut segs: Vec<crate::model::qwen4::slot_cache::Seg> = Vec::new();
+                for il in KvPool::attention_layers(&self.model.hp, s.layers.clone()) {
+                    // Rings are their own VRAM pools (not tiered, not block-addressed):
+                    // only the full-attention caches the host tier covers are copied.
+                    if s.kv.is_ring(il) {
+                        continue;
+                    }
+                    let (pk, pv) = s.kv.pools(il);
+                    for p in [pk, pv] {
+                        // SAFETY: the pool tensor's rows; the base is stable for its life.
+                        let base = unsafe { (*p.raw()).data as u64 };
+                        segs.push(crate::model::qwen4::slot_cache::Seg {
+                            base,
+                            bytes: p.nb()[1] as usize * super::state::KV_BLOCK,
+                        });
+                    }
+                }
+                crate::model::qwen4::slot_cache::register(
+                    t.device,
+                    self.kv_slots,
+                    n_blocks,
+                    cell_space,
+                    &segs,
+                );
+            }
+        }
         Ok(())
+    }
+
+    /// Turns on the KV slot cache for the next [`Self::resize_kv`]: the window in blocks
+    /// and the sequence count to size for (docs/kv-streaming-porting-notes.md §4.10).
+    pub fn set_kv_slots(&mut self, window_blocks: usize, seqs: usize) {
+        self.kv_slots = window_blocks;
+        self.kv_slots_seqs = seqs;
     }
 
     /// Gives the stages' KV pools host tiers (#352), one entry per stage (`None`: all in its

@@ -438,13 +438,13 @@ mod tests {
 // ---- runtime: the registered pools and the graph hook (the CUDA body: src/cuda/kv_slots.cu) ----
 
 /// One copy segment as the CUDA registry takes it: a pool tensor's base and one block's
-/// bytes in it. `KvPool::pool_segments` collects them for a tiered pool.
+/// bytes in it. Built per tiered attention layer's K and V by the executor.
 #[cfg(feature = "cuda")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Seg {
-    base: u64,
-    bytes: u64,
+    pub(crate) base: u64,
+    pub(crate) bytes: usize,
 }
 
 /// The window the measurement opt-in asks for (`LEGION_DEBUG_KV_SLOTS=<blocks>`); `None`
@@ -492,6 +492,10 @@ pub(crate) fn register(device: usize, w: usize, n_blocks: usize, cell_space: usi
     if !r.contains(&device) {
         r.push(device);
     }
+    drop(r);
+    // From here on a freed block id loses its slot before it can be handed out again
+    // (§4.10.6). Idempotent; every pool's free path then reaches the release queue.
+    crate::kv::BlockPool::set_free_observer(release);
     ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 

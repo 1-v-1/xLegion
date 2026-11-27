@@ -138,11 +138,11 @@ Strata 的 +6%/+23% 数字包含"KV 出 VRAM → expert slots 变多"的收益�
 6. **与现有借还机制的边界**：slot 区间计入 KV 的 VRAM 窗（`kv_fit`/`CacheShare` 语义不变）；`--kv-vmm-keep` 借出 VRAM 与 slot 池的交互 v1 用"slot 区间不借出"回避，后续再统一。
 7. **flag 与策略（终态形状）**：不新增正向开关，不改现有 flag 语义——
    - `--kv-cache-tokens` / `--kv-host-tokens` 保持容量/划界语义不变（它们对稠密模型必须继续是纯容量；把放置行为塞进容量 knob 会让既有命令行在升级后漂移，且 Strata 式"host 全量权威"的 retrofit 会白吃全池 RAM 与每 token 一次 host 镜像写）。
-   - 机制随条件**自动生效**：host tier 存在 ∧ QSA 架构 ∧ q8_0/q4_0。先例即 expert 侧热缓存——tier 就是机制，没有 enable flag（`--experts cache` 只控容量）。
-   - 唯一新增 surface：`--no-kv-slot-cache` 否定开关（A/B、排障、`--deterministic` 场景），`switches.rs` 一行，`--no-expert-peer-fetch` 式（`docs/serving.md:178` 的模式）。
-   - 尺寸 Phase 1 走 debug env（`LEGION_DEBUG_KV_SLOTS`，先例 `LEGION_DEBUG_HOST_MEM_GIB`），auto 值 = 选择工作集下界 `max_seqs × (515/4 + 2)` 块与 KV VRAM 窗的一小部分（下界纯代码可算）；Phase 2 证明需要用户级控制才升为 `--kv-slot-cache-tokens`。
-   - `--kv-vmm-keep` 交互取不变量"slot 区间不借出"（v1）。
-   - 配套：memory plan 行（`src/engine/lm/plan.rs`）、`/metrics` hit/miss/overflow（Strata `KvStreamCounters` 语义）、`docs/serving.md` 表格一行。
+   - 机制随条件**自动生效**：host tier 存在 ∧ QSA 架构 ∧ q8_0/q4_0。先例即 expert 侧热缓存——tier 就是机制，没有 enable flag（`--experts cache` 只控容量）。**落地顺序**：A/B 前用 `LEGION_DEBUG_KV_SLOTS=<W>` 显式开窗（未设=关，见 §5.4）；A/B 确认后翻 auto-on。
+   - 唯一新增 surface：`--no-kv-slot-cache` 否定开关（A/B、排障、`--deterministic` 场景），`switches.rs` 一行，`--no-expert-peer-fetch` 式（`docs/serving.md:178` 的模式）。随 auto-on 一起加。
+   - 尺寸：开发期即 debug env 的 `<W>`；auto 值 = 选择工作集下界 `max_seqs × (515/4 + 2)` 块与 KV VRAM 窗的一小部分（下界纯代码可算；实测热集 ~1.3K 块 → 默认 W 从 2048 起议）；正式 flag 留到 auto-on。
+   - `--kv-vmm-keep` / `--kv-slots` / `--tp` 与窗互斥（v1 范围限制，启动时窗自动不开并说明）。
+   - 配套（随 auto-on）：memory plan 行（`src/engine/lm/plan.rs`）、`/metrics` hit/miss/overflow、`docs/serving.md` 表格一行。开发期已有启动日志行与 debug-env 条目。
 
 ### 4.10 Phase 1 实现设计定稿（2026-11-27，读通池/写路径后）
 
@@ -234,6 +234,35 @@ kv stats: decode steps read <host> of <total> selected cells from host blocks
   只保留计数器进 `/metrics` 观察。
 - 辅助核对：`fetch ≈ 稳态增速 × unique`；`unique/rows` 持续增长 = 选择无复用。
 - 顺带验收位级不动：同请求开/关 `LEGION_DEBUG_KV_STATS` 贪心输出逐字节一致。
+
+### 5.4 Phase 1 的 A/B（slot cache 本体，`LEGION_DEBUG_KV_SLOTS=<W>`）
+
+实现落地（分支 `feat/kv-slot-cache`）：窗口=块池前 W 个 id（`BlockPool::reserve`，永不参与
+分配）；host tier 持全部其余块；resolve/copy 两内核挂在 QSA select 与 attention 之间
+（src/cuda/kv_slots.cu，镜像已测模型 src/model/qwen4/slot_cache.rs）；释放失效挂在
+`BlockPool::decref` 观察者。范围限制：需已有 host tier，不与 `--kv-slots`/`--kv-vmm-keep`/
+`--tp` 同开（v1）。flag 形状按 §4.7 定稿——A/B 证明收益后翻 auto-on 并加
+`--no-kv-slot-cache`；开发期用 env 显式开窗，未设即完全关。
+
+```sh
+# 同一命令、同一会话脚本，跑两遍对照（W 用 2048；16 GB 卡若吃紧取 1024）：
+LEGION_DEBUG_KV_SLOTS=2048 <原 AC922/4090 命令，需出现 kv host tier>
+<原命令（无 env）>
+```
+
+启动日志应出现 `kv slot cache: window over the host tier`（`window_blocks=2048`）；没有 =
+条件未满足（无 tier 或撞了范围限制）。RAM 吃紧的自动 tier 若报主机预算错误：取更小的 W，
+或显式 `--kv-host-tokens` 给定容量。看两件事：
+
+1. **同字节**：贪心（temperature 0）同请求在开/关两侧输出逐字节一致（这是 §4.1 的正确性线;
+   任何差异都是 bug，直接报）。
+2. **收益**：decode tok/s（同脚本 ≥3 轮中位数对比）。开侧 `kv stats` 的 decode
+   `cells_host` 应大幅低于关侧（理想 → 命中率 ≈ 1 − miss率；对照关侧基线 42%）。
+   expert cache 的 hit_rate 在 B 姿态下应同步上升（KV 让出的 VRAM 进了 slots）。
+
+回传：两侧 `kv slot cache:` 启动行、两侧 decode tok/s、若干条两侧稳态 `kv stats:`、以及
+同字节核对结果。据此定：翻 auto-on（收益确认）→ 加 `--no-kv-slot-cache`、进 memory plan、
+`serving.md` 转正；或调 W / 退回（数据说话）。
 
 ### 5.3 实测结果与判定（2026-11-27）
 

@@ -1,5 +1,8 @@
 //! Pure bookkeeping for paged KV storage; no token data is stored or copied here.
 
+/// The [`BlockPool::set_free_observer`] fn pointer, 0: none.
+static FREE_OBSERVER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// An index into the pool that allocated it. IDs must only be used with that pool.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct BlockId(pub u32);
@@ -262,10 +265,24 @@ impl BlockPool {
             } else if b.0 < self.slow_limit {
                 self.free_slow.push(b);
             }
+            let hook = FREE_OBSERVER.load(std::sync::atomic::Ordering::Relaxed);
+            if hook != 0 {
+                // SAFETY: a `fn(u32)` stored by [`set_free_observer`].
+                let hook: fn(u32) = unsafe { std::mem::transmute(hook) };
+                hook(b.0);
+            }
             true
         } else {
             false
         }
+    }
+
+    /// Observe blocks becoming free (called by the KV slot cache when it registers: a
+    /// freed id's cache slot must die before the id is re-used,
+    /// docs/kv-streaming-porting-notes.md §4.10.6). One relaxed load per real free;
+    /// nothing sets this without a pool whose ids it tracks.
+    pub fn set_free_observer(f: fn(u32)) {
+        FREE_OBSERVER.store(f as usize, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn ref_count(&self, b: BlockId) -> u32 {

@@ -2787,6 +2787,16 @@ impl Arch for Qwen4Params {
         table: Tensor<'a>,
     ) -> Result<Tensor<'a>, ModelError> {
         let sel = m.qsa_select(pass, il, gi, iq)?;
+        // The KV slot cache's per-step hook (docs/kv-streaming-porting-notes.md §4.10):
+        // before the attention reads the table, the resolve re-points it in place and pulls
+        // the claimed blocks into the window. Built only where the device registered a
+        // slot state; the graph is untouched otherwise. `n_past` is the paged group's
+        // per-sequence first position, what the write-span protection reads.
+        if let crate::model::core::AttnInputs::Paged { n_past, .. } = pass.attn[gi] {
+            if let Some(t) = slot_cache::node(pass.ctx, k, sel, table, n_past) {
+                pass.graph.borrow_mut().expand(t);
+            }
+        }
         Ok(qsa_attn::attention(pass.ctx, q, k, v, table, sel))
     }
 

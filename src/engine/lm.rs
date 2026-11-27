@@ -5400,6 +5400,10 @@ impl LmEngine {
         // A host tier (#352): more blocks, in pinned host memory on each GPU's node, after the
         // ones that fit in device memory. The allocator hands out device blocks first.
         let mut hbm_blocks = n_blocks;
+        // The KV slot cache's window when one takes over the VRAM range (0: off;
+        // docs/kv-streaming-porting-notes.md §4.10). Only a tier can carry it, so it is
+        // decided where the tier is sized and read by the Worker's allocator below.
+        let mut kv_slots = 0usize;
         // Per stage: the NUMA node of its KV host tier (for the startup report).
         let mut tier_nodes: Vec<Option<u32>> = Vec::new();
         // An automatic tier's place in the process's plan (#1163), for as long as the tier.
@@ -5424,6 +5428,20 @@ impl LmEngine {
                 host_blocks += cost;
                 if !tp_fit && sized > 0 {
                     host_blocks = host_blocks.min((tier_most_tokens / KV_BLOCK).max(sized));
+                }
+            }
+            // The KV slot cache (docs/kv-streaming-porting-notes.md §4.10): with a window
+            // configured over a tiered pool, the pool's VRAM range becomes the window and
+            // the host holds every other block (position B). Phase 1 scope: not with
+            // sequence slots, a lent tail or tensor parallelism; a window at or above the
+            // VRAM the fit left changes nothing (left off).
+            if let Some(w) = crate::model::qwen4::slot_cache::configured() {
+                let conflicts =
+                    exec.kv_slot_blocks() > 0 || cfg.switches.kv_vmm_keep.is_some() || cfg.tp > 1;
+                if host_tokens > 0 && !conflicts && w + 64 < hbm_blocks {
+                    kv_slots = w;
+                    host_blocks = n_blocks - w;
+                    hbm_blocks = w;
                 }
             }
             // Sequence slots: each slot's first blocks in VRAM.
@@ -5454,6 +5472,18 @@ impl LmEngine {
             tier_nodes = tiers.iter().map(|t| t.map(|t| t.node)).collect();
             let nodes: Vec<u32> = tiers.iter().flatten().map(|t| t.node).collect();
             exec.set_kv_tiers(tiers);
+            if kv_slots > 0 {
+                // The slot window replaces the VRAM range above (§4.10): register it with
+                // the executor (the pools' states are built on the resize below) and say
+                // what the host now holds: every block past the window.
+                exec.set_kv_slots(kv_slots, max_seqs);
+                tracing::info!(
+                    window_blocks = kv_slots,
+                    window_tokens = kv_slots * KV_BLOCK,
+                    host_blocks = n_blocks - kv_slots,
+                    "kv slot cache: window over the host tier (LEGION_DEBUG_KV_SLOTS)"
+                );
+            }
             if auto_tier && host_blocks > 0 {
                 // What it pins: every host block, or a lazily backed tier's budget (#1131),
                 // the latter as it fills (#1163).
@@ -6223,6 +6253,11 @@ impl LmEngine {
                     .as_ref()
                     .map_or(hbm_blocks, |l| l.keep.min(hbm_blocks));
                 let mut pool = BlockPool::with_fast(n_blocks as u32, KV_BLOCK as u32, fast as u32);
+                if kv_slots > 0 {
+                    // The slot window: the pool's first ids are the cache's, never
+                    // allocated; every sequence's block is a host-backed id (§4.10.2).
+                    pool.reserve(kv_slots as u32);
+                }
                 // None of them is handed out before it has memory (#37).
                 if let Some(l) = &kv_lend {
                     pool.set_slow_limit(l.mapped as u32);
