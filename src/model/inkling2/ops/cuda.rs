@@ -47,7 +47,7 @@ fn dim(x: i64, y: i64) -> Dim3 {
 unsafe extern "C" {
     /// The kernels as the CUDA runtime knows them (their host stubs' addresses), in
     /// [`Kernel`] order.
-    static legion_ink_kernels: [*const c_void; 12];
+    static legion_ink_kernels: [*const c_void; 18];
     fn cudaLaunchKernel(
         func: *const c_void,
         grid: Dim3,
@@ -74,6 +74,16 @@ enum Kernel {
     Situ,
     MmId,
     Softcap,
+    /// A prompt step's conv: its outputs a thread per token, then its history (#1221).
+    ConvPrompt,
+    ConvHist,
+    /// The attention kernels for blocks of one token (`ATTN_DECODE_ROWS` rows, #1221).
+    Attn32Dec,
+    Attn64Dec,
+    Attn128Dec,
+    /// The expert matmul of steps with no more pairs than experts, a warp per few rows of a
+    /// pair (#1221); `MmId` runs the rest in tiles, both with the same sums.
+    MmIdVec,
 }
 
 /// `MIX_STATES`, `MIX_QUERIES`, `CONV_TAPS` of the kernels.
@@ -83,12 +93,14 @@ const CONV_TAPS: i64 = 8;
 /// `ATTN_TQ`, `ATTN_ROWS`, `ATTN_NR` and the threads of the attention kernel.
 const ATTN_TQ: i64 = 4;
 const ATTN_ROWS: i64 = 16;
+const ATTN_DECODE_ROWS: i64 = 4;
 const ATTN_NR: i64 = 16;
 const ATTN_THREADS: u32 = 128;
-/// `MM_ROWS`, `MM_P` of the expert matmul, and the most shared memory its inputs take.
-const MM_ROWS: i64 = 64;
-const MM_P: i64 = 4;
-const MM_SHARED: i64 = 40 * 1024;
+/// `MM_BM` and `MM_THREADS` of the expert matmul's tiles, and the rows of a block of its
+/// decode kernel (`MM_VEC_ROWS` a warp).
+const MM_BM: i64 = 32;
+const MM_THREADS: u32 = 256;
+const MM_VEC_BLOCK_ROWS: i64 = 8 * 4;
 
 /// The node `dst` as the kernels read it.
 unsafe fn args(dst: &ffi::ggml_tensor) -> Args {
@@ -230,17 +242,45 @@ pub(super) unsafe fn conv(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
             return Err("ink_conv: more taps than the kernel holds".into());
         }
         let n_tok = external_params(dst)[0] as i64;
+        let n_seqs = dst.ne[1] / n_tok;
+        let blocks = cdiv(dst.ne[0], 128);
+        if n_tok < CONV_PROMPT_MIN || n_tok > GRID_YZ || n_seqs > GRID_YZ {
+            return launch(
+                Kernel::Conv,
+                "ink_conv",
+                dst,
+                dim(blocks, n_seqs),
+                128,
+                0,
+                stream,
+            );
+        }
+        // A prompt step: the outputs over (channels, tokens, sequences), then the history
+        // from the step's last inputs (the same values as the token walk's, #1221).
+        let grid = Dim3 {
+            x: blocks as u32,
+            y: n_tok as u32,
+            z: n_seqs as u32,
+        };
+        launch(Kernel::ConvPrompt, "ink_conv", dst, grid, 128, 0, stream)?;
         launch(
-            Kernel::Conv,
+            Kernel::ConvHist,
             "ink_conv",
             dst,
-            dim(cdiv(dst.ne[0], 128), dst.ne[1] / n_tok),
+            dim(blocks, n_seqs),
             128,
             0,
             stream,
         )
     }
 }
+
+/// The fewest tokens a sequence of a step has for [`conv`] to run them a thread each
+/// (`conv_prompt_kernel`) rather than walk them (`conv_kernel`); the same outputs either way.
+const CONV_PROMPT_MIN: i64 = 2;
+
+/// The most blocks along a grid's y or z.
+const GRID_YZ: i64 = 65_535;
 
 pub(super) unsafe fn clip(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
     if dst.ne[0] > 128 {
@@ -289,12 +329,19 @@ pub(super) unsafe fn attn(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
         }
         let n_tok = external_params(dst)[0] as i64;
         let n_seqs = dst.ne[2] / n_tok;
+        // Blocks of one token hold pk rows: the kernel with that few in registers (#1221).
+        let k = match k {
+            Kernel::Attn32 if n_tok == 1 && pk <= ATTN_DECODE_ROWS => Kernel::Attn32Dec,
+            Kernel::Attn64 if n_tok == 1 && pk <= ATTN_DECODE_ROWS => Kernel::Attn64Dec,
+            Kernel::Attn128 if n_tok == 1 && pk <= ATTN_DECODE_ROWS => Kernel::Attn128Dec,
+            k => k,
+        };
         // CUDA's grid y limit: a group this large is refused, not launched wrong.
         let grid_y = n_seqs * cdiv(n_tok, ATTN_TQ);
-        if grid_y > 65535 {
+        if grid_y > GRID_YZ {
             return Err(format!(
                 "ink_attn: {n_seqs} sequences of {n_tok} tokens need a grid y of {grid_y} \
-                 (CUDA takes 65535)"
+                 (CUDA takes {GRID_YZ})"
             ));
         }
         launch(
@@ -322,23 +369,19 @@ pub(super) unsafe fn situ(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
 pub(super) unsafe fn mm_id(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result<(), String> {
     // SAFETY: a node of this op; its sources were checked by the builder.
     unsafe {
-        let w = src(dst, 0);
-        let k = w.ne[0];
-        let shared = MM_P * k * 4;
-        if shared > MM_SHARED {
-            return Err(format!(
-                "ink_mm_id: rows of {k} (the kernel takes up to 2,560)"
-            ));
-        }
-        launch(
-            Kernel::MmId,
-            "ink_mm_id",
-            dst,
-            dim(cdiv(dst.ne[0], MM_ROWS), w.ne[2]),
-            256,
-            shared as usize,
-            stream,
-        )
+        let experts = src(dst, 0).ne[2];
+        let pairs = dst.ne[1] * dst.ne[2];
+        // Few pairs (decode): a block per pair reads only its expert's weights. More: a block
+        // per expert reuses each weight for up to `MM_BN` pairs. Same sums either way.
+        let (k, grid) = if pairs <= experts.min(GRID_YZ) {
+            (
+                Kernel::MmIdVec,
+                dim(cdiv(dst.ne[0], MM_VEC_BLOCK_ROWS), pairs),
+            )
+        } else {
+            (Kernel::MmId, dim(cdiv(dst.ne[0], MM_BM), experts))
+        };
+        launch(k, "ink_mm_id", dst, grid, MM_THREADS, 0, stream)
     }
 }
 

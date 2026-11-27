@@ -629,6 +629,39 @@ fn tiny_runs_the_same_in_any_chunking() {
     assert!(d <= tol, "token by token: {d} > {tol}");
 }
 
+/// #1221: every op of a decode step (one token, and four of one sequence) is one that a small
+/// step's stage graph captures once a loaded Inkling-2 turns the shared ops' switch on, so the
+/// step is one capture instead of ~2,000 launches from the host. A new op left out of the
+/// lists fails here.
+#[test]
+fn a_decode_step_is_captured_whole() {
+    use crate::model::core::stage_ops::{INKLING, INKLING_SHARED, listed_as};
+    let dir = tempfile::tempdir().unwrap();
+    let g = tiny_gguf(&dir, Layout::Mainline);
+    let mut b = backend();
+    let m = Model::load(&g, |_| b.buffer_type()).unwrap();
+    let mut st = m.new_state(b.buffer_type(), 256).unwrap();
+    let mut alloc = None;
+    m.forward(&mut b, &mut alloc, &mut st, &prompt(), false)
+        .unwrap();
+    for tokens in [&[7u32][..], &[7, 8, 9, 10]] {
+        let mut counts: HashMap<&'static str, usize> = HashMap::new();
+        m.step_external_ops(&st, tokens, |op, _| {
+            *counts.entry(op.name).or_default() += 1;
+        })
+        .unwrap();
+        let total: usize = counts.values().sum();
+        eprintln!("{} tokens: {total} external ops {counts:?}", tokens.len());
+        assert!(counts.contains_key("ink_attn") && counts.contains_key("glm_rms_norm"));
+        for name in counts.keys() {
+            assert!(listed_as(name, true, true), "`{name}` cuts the capture");
+            if INKLING.contains(name) || INKLING_SHARED.contains(name) {
+                assert!(!listed_as(name, false, true), "`{name}` in prompt steps");
+            }
+        }
+    }
+}
+
 /// The engine's batch steps (paged caches, two sequences, the sliding slots in rings or whole)
 /// give the tokens of whole caches: the conv histories are per sequence.
 #[test]
@@ -832,6 +865,260 @@ fn gpu_backend() -> Backend {
         .expect("no GPU device")
         .init()
         .unwrap()
+}
+
+/// #1221: a prompt step's conv on the GPU (a thread per token, then the history) gives the
+/// bits of the decode steps' token walk, outputs and history, with and without dynamic taps,
+/// for steps longer and shorter than the history.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_conv_prompt_steps_are_the_token_walk() {
+    use crate::ggml::ComputeAllocator;
+    let mut gpu = gpu_backend();
+    let vals = |n: usize, seed: u64| -> Vec<f32> {
+        let mut s = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+            })
+            .collect()
+    };
+    let (k, c, heads, width, off, scale) = (4i64, 96i64, 4i64, 160i64, 32i64, 0.75f32);
+    for (n_tok, n_seqs, dynamic) in [(37i64, 2i64, true), (37, 2, false), (2, 3, true)] {
+        let ng = n_tok * n_seqs;
+        let ctx = Context::new(64 + 16 * n_tok as usize, 64 + 16 * n_tok as usize);
+        let x = ctx.new_tensor(types::F32, &[c, ng]).as_input();
+        let w = ctx.new_tensor(types::F32, &[k, c]).as_input();
+        let d = ctx.new_tensor(types::F32, &[k * heads, ng]).as_input();
+        let st = [0, 1].map(|_| {
+            ctx.new_tensor(types::F32, &[k - 1, width, n_seqs])
+                .as_input()
+                .as_output()
+        });
+        let once = ops::conv(&ctx, x, w, st[0], dynamic.then_some(d), n_tok, off, scale);
+        let once = once.as_output();
+        let mut graph = ctx.new_graph(64 + 8 * n_tok as usize);
+        graph.expand(once);
+        // The walk's inputs: token `i` of every sequence (columns `s · n_tok + i`), each its
+        // own contiguous `[rows, n_seqs]` tensor, as the ops take them.
+        let mut walk = Vec::new();
+        let mut walk_in = Vec::new();
+        for _ in 0..n_tok {
+            let xi = ctx.new_tensor(types::F32, &[c, n_seqs]).as_input();
+            let di = dynamic.then(|| ctx.new_tensor(types::F32, &[k * heads, n_seqs]).as_input());
+            let o = ops::conv(&ctx, xi, w, st[1], di, 1, off, scale);
+            let o = o.as_output();
+            graph.expand(o);
+            walk.push(o);
+            walk_in.push((xi, di));
+        }
+        ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+            .unwrap();
+        let (xv, dv) = (
+            vals((c * ng) as usize, 1),
+            vals((k * heads * ng) as usize, 3),
+        );
+        x.set_f32(&xv);
+        w.set_f32(&vals((k * c) as usize, 2));
+        if dynamic {
+            d.set_f32(&dv);
+        }
+        let cols = |v: &[f32], rows: usize, i: usize| -> Vec<f32> {
+            (0..n_seqs as usize)
+                .flat_map(|s| v[(s * n_tok as usize + i) * rows..][..rows].to_vec())
+                .collect()
+        };
+        for (i, (xi, di)) in walk_in.iter().enumerate() {
+            xi.set_f32(&cols(&xv, c as usize, i));
+            if let Some(di) = di {
+                di.set_f32(&cols(&dv, (k * heads) as usize, i));
+            }
+        }
+        let hist = vals(((k - 1) * width * n_seqs) as usize, 4);
+        for s in st {
+            s.set_f32(&hist);
+        }
+        gpu.compute(&graph).unwrap();
+        let once = once.to_f32();
+        let walk: Vec<Vec<f32>> = walk.into_iter().map(|o| o.to_f32()).collect();
+        let case = format!("{n_tok} tokens, {n_seqs} sequences, dynamic {dynamic}");
+        for s in 0..n_seqs as usize {
+            for i in 0..n_tok as usize {
+                let t = s * n_tok as usize + i;
+                let (a, b) = (
+                    &once[t * c as usize..][..c as usize],
+                    &walk[i][s * c as usize..][..c as usize],
+                );
+                assert!(
+                    a.iter().zip(b).all(|(p, q)| p.to_bits() == q.to_bits()),
+                    "{case}: token {i} of sequence {s}"
+                );
+            }
+        }
+        assert_eq!(st[0].bytes(), st[1].bytes(), "{case}: the history");
+        assert_ne!(st[0].to_f32(), hist, "{case}: the history moved");
+    }
+}
+
+/// #1221: the GPU expert matmul's decode (a block per pair) and prompt (a block per expert, in
+/// tiles) kernels both give the bits of the sums it always had: warp_sum over the 32 lanes of
+/// lane l's fused multiply-add chain over the groups of `w[32 gi + l] · x[32 gi + l]`. Q8_0,
+/// MXFP8 and F32 stacks, shared and per-pair inputs, out-of-range ids, a K tail past whole
+/// passes and an expert taking more pairs than its list holds at once.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a GPU"]
+fn cuda_expert_matmul_keeps_its_lane_sums() {
+    use crate::ggml::ComputeAllocator;
+    let mut gpu = gpu_backend();
+    let mut s = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let (k, m, n_exp, n_used) = (320usize, 40usize, 6usize, 3usize);
+    // The weights as the kernels read them, and their bytes.
+    let q8 = |next: &mut dyn FnMut() -> u64| -> (Vec<f32>, Vec<u8>) {
+        let (mut v, mut b) = (Vec::new(), Vec::new());
+        for _ in 0..k * m * n_exp / 32 {
+            let d = f32_to_f16(((next() >> 40) as f32 / (1u64 << 24) as f32 + 0.5) / 64.0);
+            b.extend(d.to_le_bytes());
+            for _ in 0..32 {
+                let q = (next() >> 56) as u8 as i8;
+                b.push(q as u8);
+                v.push(f16_to_f32(d) * q as f32);
+            }
+        }
+        (v, b)
+    };
+    let mx = |next: &mut dyn FnMut() -> u64| -> (Vec<f32>, Vec<u8>, Vec<f32>) {
+        let sc: Vec<f32> = (0..k * m * n_exp / 32)
+            .map(|_| (1 + (next() >> 60)) as f32 / 32.0)
+            .collect();
+        let mut b = Vec::new();
+        let v = (0..k * m * n_exp)
+            .map(|i| {
+                let mut q = (next() >> 56) as u8;
+                if q & 0x7f == 0x7f {
+                    q ^= 1;
+                }
+                b.push(q);
+                crate::model::fp8::e4m3_to_f32(q) * sc[i / 32]
+            })
+            .collect();
+        (v, b, sc)
+    };
+    let f = |next: &mut dyn FnMut() -> u64, n: usize| -> Vec<f32> {
+        (0..n)
+            .map(|_| (next() >> 40) as f32 / (1u64 << 23) as f32 - 1.0)
+            .collect()
+    };
+    // Lane sums in the kernels' order.
+    let lane_sum = |w: &[f32], x: &[f32]| -> f32 {
+        let mut lanes = [0f32; 32];
+        for (l, acc) in lanes.iter_mut().enumerate() {
+            for gi in 0..k / 32 {
+                *acc = w[gi * 32 + l].mul_add(x[gi * 32 + l], *acc);
+            }
+        }
+        for o in [16, 8, 4, 2, 1] {
+            let prev = lanes;
+            for (l, v) in lanes.iter_mut().enumerate() {
+                *v = prev[l] + prev[l ^ o];
+            }
+        }
+        lanes[0]
+    };
+    for ty in [types::Q8_0, types::I8, types::F32] {
+        let (wv, wb, sc) = match ty {
+            types::Q8_0 => {
+                let (v, b) = q8(&mut next);
+                (v, b, None)
+            }
+            types::I8 => {
+                let (v, b, s) = mx(&mut next);
+                (v, b, Some(s))
+            }
+            _ => {
+                let v = f(&mut next, k * m * n_exp);
+                let b = v.iter().flat_map(|v| v.to_le_bytes()).collect();
+                (v, b, None)
+            }
+        };
+        // Decode steps, a short prompt, and a prompt routing most pairs to expert 1.
+        let cases = [
+            (1usize, true),
+            (2, false),
+            (9, true),
+            (400, false),
+            (400, true),
+        ];
+        for (n_tok, shared) in cases {
+            let ids: Vec<i32> = (0..n_tok * n_used)
+                .map(|i| match next() % 16 {
+                    0 => -1,
+                    1 => n_exp as i32,
+                    2..=4 => (next() % n_exp as u64) as i32,
+                    _ if n_tok > 100 => 1,
+                    _ => (i % n_exp) as i32,
+                })
+                .collect();
+            let nx = if shared { 1 } else { n_used };
+            let xv = f(&mut next, k * nx * n_tok);
+            let ctx = Context::new(16, 16);
+            let w = ctx
+                .new_tensor(ty, &[k as i64, m as i64, n_exp as i64])
+                .as_input();
+            let scale = sc.as_ref().map(|_| {
+                ctx.new_tensor(types::F32, &[(k / 32) as i64, m as i64, n_exp as i64])
+                    .as_input()
+            });
+            let x = ctx
+                .new_tensor(types::F32, &[k as i64, nx as i64, n_tok as i64])
+                .as_input();
+            let id = ctx
+                .new_tensor(types::I32, &[n_used as i64, n_tok as i64])
+                .as_input();
+            let y = ops::mm_id(&ctx, w, scale, x, id).as_output();
+            let mut graph = ctx.new_graph(16);
+            graph.expand(y);
+            ctx.alloc_graph(&graph, ComputeAllocator::new(gpu.buffer_type()))
+                .unwrap();
+            w.set_bytes(&wb);
+            if let (Some(t), Some(v)) = (scale, &sc) {
+                t.set_f32(v);
+            }
+            x.set_f32(&xv);
+            let id_bytes: Vec<u8> = ids.iter().flat_map(|i| i.to_le_bytes()).collect();
+            id.set_bytes(&id_bytes);
+            gpu.compute(&graph).unwrap();
+            let y = y.to_f32();
+            let tn = crate::ggml::type_name(ty);
+            let case = format!("{tn} stack, {n_tok} tokens, shared input {shared}");
+            for (pr, &e) in ids.iter().enumerate() {
+                let (t, j) = (pr / n_used, pr % n_used);
+                let xr = &xv[(t * nx + if shared { 0 } else { j }) * k..][..k];
+                for r in 0..m {
+                    let want = if e < 0 || e as usize >= n_exp {
+                        0.0
+                    } else {
+                        lane_sum(&wv[(e as usize * m + r) * k..][..k], xr)
+                    };
+                    assert_eq!(
+                        y[pr * m + r].to_bits(),
+                        want.to_bits(),
+                        "{case}: pair {pr} (expert {e}), row {r}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// `t`'s per-expert entries of each token in the order of the experts' ids `ids` (`[k, n]`):
