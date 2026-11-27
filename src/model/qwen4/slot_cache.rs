@@ -583,9 +583,9 @@ unsafe fn cuda_slots(
         let n_seqs = tab_t.ne[1].max(1);
         legion_kv_slots_graph(
             sel_t.data as *const i32,
-            sel_t.nb[1] / 4,
+            sel_t.nb[1] as i64 / 4,
             tab_t.data as *mut i32,
-            tab_t.nb[1] / 4,
+            tab_t.nb[1] as i64 / 4,
             pos_t.data as *const i32,
             rows as i32,
             (rows / n_seqs).max(1) as i32,
