@@ -65,6 +65,7 @@ mod ple_late;
 pub(crate) use ple_late::LateRows;
 pub use ple_late::set_ple_early_reads;
 pub(crate) mod kv_stats;
+pub(crate) mod slot_cache;
 pub(crate) mod qsa_attn;
 pub use qsa_attn::PromptKernel;
 #[cfg(feature = "cuda")]
