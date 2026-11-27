@@ -211,6 +211,24 @@ impl BlockPool {
         Some(block)
     }
 
+    /// Take the first `n` blocks out of circulation for the process's life (the KV slot
+    /// cache's window, docs/kv-streaming-porting-notes.md §4.10): they keep a reference
+    /// [`Self::allocate`] can never hand out and [`Self::decref`] never returns, so every
+    /// block a sequence is given is an id at `n` or above, and the first ids stay the
+    /// cache's fixed addresses. A slotted pool has no such ids (its ranges are per slot).
+    pub fn reserve(&mut self, n: u32) {
+        assert!(
+            self.slot_blocks == 0,
+            "a slotted pool cannot reserve a head"
+        );
+        let n = n.min(self.ref_counts.len() as u32);
+        self.free.retain(|b| b.0 >= n);
+        self.free_slow.retain(|b| b.0 >= n);
+        for count in &mut self.ref_counts[..n as usize] {
+            *count = 1;
+        }
+    }
+
     /// Allocate block `b` of a slotted pool with a reference count of one, if it is free.
     fn allocate_at(&mut self, b: BlockId) -> Option<BlockId> {
         let count = self.ref_counts.get_mut(b.0 as usize)?;

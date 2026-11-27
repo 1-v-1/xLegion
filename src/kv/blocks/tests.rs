@@ -2,6 +2,29 @@ use super::*;
 use proptest::prelude::*;
 use std::collections::HashSet;
 
+/// The slot cache's window: the reserved head is never handed out, raising the slow limit
+/// does not resurrect it, and the rest of the pool keeps its allocation order.
+#[test]
+fn reserve_takes_the_head_out_of_circulation() {
+    let mut pool = BlockPool::with_fast(8, 16, 6);
+    pool.reserve(3);
+    assert_eq!(pool.free_blocks(), 5);
+    for _ in 0..5 {
+        let b = pool.allocate().expect("the unreserved tail allocates");
+        assert!(b.0 >= 3, "a reserved block was handed out: {}", b.0);
+    }
+    assert_eq!(pool.allocate(), None);
+    // Raising a limit past the head still skips it (its reference is the engine's).
+    pool.set_slow_limit(8);
+    assert_eq!(pool.allocate(), None);
+    for id in 0..3 {
+        assert_eq!(pool.ref_count(BlockId(id)), 1);
+    }
+    // Freed blocks return and reuse normally, above the head.
+    assert!(pool.decref(BlockId(7)));
+    assert_eq!(pool.allocate(), Some(BlockId(7)));
+}
+
 #[test]
 fn pool_allocates_until_exhausted_and_reuses_freed_blocks_lifo() {
     let mut pool = BlockPool::new(3, 16);
