@@ -5456,20 +5456,31 @@ impl LmEngine {
                         tp = cfg.tp > 1,
                         "kv slot cache: off (out of Phase 1 scope: --kv-slots / --kv-vmm-keep / --tp)"
                     );
-                } else if w + 64 >= hbm_blocks {
+                } else if w + 64 >= hbm_blocks + host_blocks {
                     tracing::info!(
                         window_blocks = w,
                         device_blocks = hbm_blocks,
-                        "kv slot cache: off (the window would not be smaller than the VRAM range)"
+                        host_blocks,
+                        "kv slot cache: off (the pool cannot spare a window and one context)"
                     );
                 } else {
-                    // Position B redistributes, it does not resize: the host takes every
-                    // block the VRAM window gives up - the pool's total capacity (and the
-                    // block tables' width, capped by it) stays what the fit and the tier
-                    // sized, exactly what a context of the full length needs (§4.10).
-                    kv_slots = w;
-                    host_blocks = hbm_blocks + host_blocks - w;
-                    hbm_blocks = w;
+                    // A window at or above the old device range is legal: same VRAM, smarter
+                    // placement. The one real bound is the host side - sequences only ever
+                    // hold host-backed ids, so what a window leaves over must still hold a
+                    // context; clamp there and say so. Position B never resizes the pool:
+                    // the host takes exactly the blocks the window gives up (§4.10).
+                    let max_w = (hbm_blocks + host_blocks).saturating_sub(cfg.ctx_size.div_ceil(KV_BLOCK));
+                    let w_eff = w.min(max_w.max(8));
+                    if w_eff != w {
+                        tracing::info!(
+                            asked_blocks = w,
+                            window_blocks = w_eff,
+                            "kv slot cache: the window was clamped to keep one context of host blocks"
+                        );
+                    }
+                    kv_slots = w_eff;
+                    host_blocks = hbm_blocks + host_blocks - w_eff;
+                    hbm_blocks = w_eff;
                 }
             }
             // Sequence slots: each slot's first blocks in VRAM.
