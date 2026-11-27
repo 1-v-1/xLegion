@@ -2786,12 +2786,6 @@ impl Arch for Qwen4Params {
         table: Tensor<'a>,
     ) -> Result<Tensor<'a>, ModelError> {
         let sel = m.qsa_select(pass, il, gi, iq)?;
-        // The slot cache's Phase 0 measurement (docs/kv-streaming-porting-notes.md): counts
-        // this step's selections into the pool's host-tier counters, writes nothing the model
-        // reads. `None` unless `LEGION_DEBUG_KV_STATS=1` on a pool that has a host tier.
-        if let Some(t) = kv_stats::node(pass.ctx, k, sel, table) {
-            pass.graph.borrow_mut().expand(t);
-        }
         Ok(qsa_attn::attention(pass.ctx, q, k, v, table, sel))
     }
 

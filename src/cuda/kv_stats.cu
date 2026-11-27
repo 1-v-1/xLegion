@@ -2,11 +2,15 @@
 // src/model/qwen4/kv_stats.rs, docs/kv-streaming-porting-notes.md): count where the QSA
 // selections land, per block, on a pool that has a host tier.
 //
-// The kernel reads the selection rows and the block table, which are graph data already, and
-// writes only the counters, so the model's bits are the same with the measurement on or off.
+// The counting is what `after_attn` does after a step's attention launch (next to the
+// selection dump of sel_dump.rs): one extra kernel on the step's stream, behind nothing
+// the model reads. No graph node, no tensor, no allocation: the graph is the same graph
+// with the measurement on or off, and the kernel reads only the selection rows and block
+// table and writes only the counters, so the model's bits are untouched.
+//
 // The counters live in device memory at fixed addresses, one set per device (the registry
-// pattern of cvec.cu: `legion_kv_stats_ensure` builds them at pool-build time, and a launch
-// only reads the map), so the captured graphs never bake an address the load could move.
+// pattern of cvec.cu: `legion_kv_stats_ensure` builds them at pool-build time, and a
+// launch only reads the map), so the captured graphs bake no address the load could move.
 // The readback is a synchronous copy the reporter thread runs outside the graphs.
 //
 // What a step's rows say (per bucket: 0 decode and verify, 8 prompt):
@@ -23,32 +27,13 @@
 #include <cstdint>
 #include <map>
 
-extern "C" {
-
-/// The kernel's parameters (filled by the Rust launcher from the node's tensors): plain
-/// pointers and sizes; the counter pointers are taken from the registry by `dev`.
-struct kv_stats_args {
-    const int* sel;      // (rows, cap+1) I32: [count, positions ascending, -1] (qsa_attn.cu's form)
-    long long sel_nb1;   // elements between rows
-    const int* tab;      // (max_blocks, n_seqs) I32 block tables
-    long long tab_nb1;
-    int cap;             // position slots per row (sel's ne[0] - 1)
-    int rows;            // selection rows (the step's tokens)
-    int n_tok;           // tokens per sequence (rows / n_seqs)
-    long long hbm;       // block ids below this live in VRAM
-    long long n_host;    // host blocks (the hist's capacity as of graph build)
-    int dev;             // the device the counters belong to
-    int off;             // 0: decode and verify, 8: prompt
-};
-
-}  // extern "C"
-
 namespace {
 
 struct Ctr {
     unsigned long long* hist = nullptr;  // (n_host,) fetches per host block
     unsigned long long* ctl = nullptr;   // 16 u64
     long long n_host = 0;
+    long long hbm = 0;  // the pool's first host block (the registered one, not the baked)
 };
 
 std::map<int, Ctr> g_ctr;  // one pool per device (the tiers are per device)
@@ -76,7 +61,7 @@ __global__ void kv_stats_kernel(const int* __restrict__ sel, long long sel_nb1,
     }
     atomicAdd(&ctl[off + 1], 1ULL);
     const long long h = (long long)blk - hbm;
-    if (h >= n_host) return;  // the pool moved since the graph was built: totals only
+    if (h >= n_host) return;  // the pool moved since: totals only
     // The positions are ascending, so an earlier cell of the same row says this block was
     // already fetched for this token: the histogram counts each fetch once, as a slot pool
     // would move it once.
@@ -89,12 +74,16 @@ __global__ void kv_stats_kernel(const int* __restrict__ sel, long long sel_nb1,
 
 extern "C" {
 
-/// Builds device `dev`'s counters for a pool with `n_host` host blocks, zeroed. A resize
-/// moves the host range's block ids, so a changed `n_host` starts the counters over; a pool
-/// rebuilt at the same size keeps them. A CUDA error code, 0 for good.
-int legion_kv_stats_ensure(int dev, long long n_host) {
+/// Builds device `dev`'s counters for a pool whose host range is `n_host` blocks wide
+/// starting at block `hbm`, zeroed. A resize moves the host range's block ids, so a
+/// changed `n_host` starts the counters over; a pool rebuilt at the same size keeps them.
+/// A CUDA error code, 0 for good.
+int legion_kv_stats_ensure(int dev, long long n_host, long long hbm) {
     Ctr& c = g_ctr[dev];
-    if (c.hist != nullptr && c.n_host == n_host) return 0;
+    if (c.hist != nullptr && c.n_host == n_host) {
+        c.hbm = hbm;  // the same host size at a new boundary: the kernel reads the latest
+        return 0;
+    }
     if (c.hist != nullptr) {
         cudaFree(c.hist);
         cudaFree(c.ctl);
@@ -116,22 +105,29 @@ int legion_kv_stats_ensure(int dev, long long n_host) {
         return 1;
     }
     c.n_host = n_host;
+    c.hbm = hbm;
     return 0;
 }
 
-/// Enqueues the counting kernel on `stream`. A device whose counters are gone (a close, a
-/// resize that refused) counts nothing: the graphs that still name the op stay replayable.
-void legion_kv_stats_launch(const kv_stats_args* a, void* stream) {
-    const auto it = g_ctr.find(a->dev);
+/// Enqueues the counting kernel on `stream` for the step's selection rows
+/// (`rows` rows of `sel_nb1` I32s, cap = sel_nb1 - 1) and block tables (`tab_nb1`
+/// = the table width). A device with no registered pool counts nothing: the hook needs
+/// no branch at the call site beyond the switch.
+void legion_kv_stats_after(const int* sel, long long sel_nb1, const int* tab, long long tab_nb1,
+                           int rows, int n_tok, int off, void* stream) {
+    int dev;
+    if (cudaGetDevice(&dev) != cudaSuccess) return;
+    const auto it = g_ctr.find(dev);
     if (it == g_ctr.end() || it->second.hist == nullptr) return;
-    const long long total = (long long)a->rows * a->cap;
-    if (total == 0) return;
+    const int cap = (int)sel_nb1 - 1;
+    const long long total = (long long)rows * cap;
+    if (total <= 0) return;
     const int block = 256;
     const long long grid = (total + block - 1) / block;
     if (grid > 0x7fffffffLL) return;  // a selection that wide is a bug, not a measurement
     kv_stats_kernel<<<(int)grid, block, 0, (cudaStream_t)stream>>>(
-        a->sel, a->sel_nb1, a->tab, a->tab_nb1, a->cap, a->rows, a->n_tok, a->hbm, a->n_host,
-        a->off, it->second.hist, it->second.ctl);
+        sel, sel_nb1, tab, tab_nb1, cap, rows, n_tok, it->second.hbm, it->second.n_host, off,
+        it->second.hist, it->second.ctl);
 }
 
 /// Copies device `dev`'s counters out: `ctl` holds 16 values, `hist` the n_host the ensure
@@ -148,12 +144,6 @@ int legion_kv_stats_read(int dev, unsigned long long* ctl, unsigned long long* h
                          cudaMemcpyDeviceToHost) == cudaSuccess;
     cudaSetDevice(prev);
     return ok ? 0 : 1;
-}
-
-/// The n_host device `dev`'s counters were built for, -1: none.
-long long legion_kv_stats_n_host(int dev) {
-    const auto it = g_ctr.find(dev);
-    return it == g_ctr.end() || it->second.hist == nullptr ? -1 : it->second.n_host;
 }
 
 /// Zeroes device `dev`'s counters (a measurement run starts from here).

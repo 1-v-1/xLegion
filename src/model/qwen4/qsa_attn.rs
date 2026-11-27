@@ -1985,6 +1985,24 @@ unsafe fn cuda_attn_codes(dst: &ffi::ggml_tensor, stream: *mut c_void) -> Result
 #[cfg(feature = "cuda")]
 unsafe fn after_attn(o: &Operands, stream: *mut c_void) {
     let tokens = o.n_tok * o.n_seqs;
+    if super::kv_stats::enabled() {
+        // The slot cache's Phase 0 measurement (docs/kv-streaming-porting-notes.md): where
+        // this step's selections land on the pool's host tier, on the device's counters.
+        // SAFETY: the node's selection rows and block tables, as the attention launch that
+        // just ran read them.
+        unsafe {
+            super::kv_stats::after(
+                o.sel,
+                o.sel_row,
+                o.table,
+                o.table_width,
+                tokens,
+                o.n_tok,
+                if tokens as i64 > DECODE_TOKENS { 8 } else { 0 },
+                stream,
+            );
+        }
+    }
     if tokens as i64 > DECODE_TOKENS && sel_dump::enabled() {
         // SAFETY: the node's selection rows, `tokens` of `sel_row` I32s.
         unsafe { sel_dump::after(o.sel, tokens, o.sel_row, o.n_tok, stream) };
