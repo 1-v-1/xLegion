@@ -64,6 +64,7 @@ pub mod kv_type;
 pub mod l2_prefetch;
 mod linear;
 pub mod media;
+pub mod mma_peak;
 pub mod mmq_ids;
 pub use mmq_ids::set_mmq_ids;
 pub(crate) mod mmq_preq;
@@ -108,6 +109,8 @@ pub use router_mv::set_router_mv;
 pub(crate) mod mmvq_glu;
 pub use mmvq_glu::set_mmvq_glu;
 pub(crate) mod state;
+#[cfg(test)]
+mod step_ops;
 pub mod tp;
 pub(crate) mod tp_ep;
 pub mod traffic;
@@ -3449,8 +3452,21 @@ impl Model {
                         ctx.get_rows(self.w("token_embd.weight")?, inputs.tokens),
                     ),
                 };
-                // Image tokens take their vision rows instead ([`Media`]).
+                // Image tokens take their vision rows instead ([`Media`]); an embedding that
+                // is already a token's residual streams (`[e, hc, n]`, GLM-5.3-Flash) takes
+                // them in every stream, as its tokens' rows are.
                 match inputs.img {
+                    Some((rows, idx)) if x.ne()[1] * x.ne()[2] != n => {
+                        let [e, hc, nt, _] = x.ne();
+                        let k = rows.ne()[1];
+                        let r = ctx.repeat_4d(ctx.reshape_3d(rows, e, 1, k), [e, hc, k, 1]);
+                        let x = ctx.set_rows(
+                            ctx.reshape_2d(x, e * hc, nt),
+                            ctx.reshape_2d(r, e * hc, k),
+                            idx,
+                        );
+                        ctx.reshape_3d(x, e, hc, nt)
+                    }
                     Some((rows, idx)) => ctx.set_rows(x, rows, idx),
                     None => x,
                 }
