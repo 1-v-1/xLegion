@@ -668,4 +668,7 @@ unsafe extern "C" {
     );
     /// A freed block's slot dies.
     fn legion_kv_slots_release(id: i32);
+    /// The kernel-mirrored counters (6 u64): hits, misses, protected, evictions, overflow,
+    /// drops. Reads pinned memory, no CUDA call. 3: no state.
+    fn legion_kv_slots_read(dev: i32, ctl: *mut u64) -> i32;
 }
