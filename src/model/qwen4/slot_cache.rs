@@ -1,14 +1,18 @@
 //! The KV slot cache's state model: the residency arrays and the per-step resolve
 //! ([`SlotState::resolve_step`]). The design and why: docs/kv-streaming-porting-notes.md
 //! §4.10, and the measured basis: §5.3 (42.5% of decode's selected cells read the KV host
-//! tier; the 1K hottest blocks carry 93% of the fetches).//!
-//! Position B: on a pool with a host tier, the pool's first `w` block ids are the slot
-//! window (VRAM, reserved out of allocation with [`crate::kv::BlockPool::reserve`]); every
-//! block a sequence holds is a host-backed identity id. A slot is a copy of one block whose
-//! bytes equal the host's: a block this step writes is never a *claim*, and if it is already
-//! resident this step's copy refreshes it from the authority (the write-through §4.10.1
-//! dropped; taken here as a whole-block byte copy, so a copy matches `set_rows` bit for bit
-//! and never goes stale).
+//! tier; the 1K hottest blocks carry 93% of the fetches).
+//!
+//! The window lives **inside** the device range `--kv-cache-tokens` already opened: the pool's
+//! first `w` block ids are reserved out of allocation ([`crate::kv::BlockPool::reserve`]), so
+//! no sequence is ever handed one, and neither capacity flag changes meaning. What it costs is
+//! KV capacity - sequences share `n_blocks - w` blocks instead of `n_blocks` - and nothing
+//! else: no extra VRAM, no extra pinned RAM, and the tier boundary stays where the user put
+//! it, so recent blocks keep landing in device memory on their own (§4.10.2).
+//! A slot is a copy of one block whose bytes equal the authority's: a block this step writes
+//! is never a *claim*, and if it is already resident this step's copy refreshes it from the
+//! authority (the write-through §4.10.1 dropped; taken here as a whole-block byte copy, so a
+//! copy matches what the write kernel stored bit for bit and never goes stale).
 //!
 //! This module is the model that both other bodies mirror:
 //! - the op's CPU implementation runs it as its reference (tests, and the parity oracle);
@@ -538,7 +542,7 @@ pub(crate) fn report_bad(bad: (u64, u64, u64)) {
         kind = bad.0,
         a = bad.1,
         b = bad.2,
-        "kv slots: a window invariant broke (1 entry names an unclaimed slot, 2 id outside the pool, 3 mapping past the window, 4 victim took a live slot)"
+        "kv slots: a window invariant broke (1 entry names an unclaimed slot, 2 id outside the pool, 3 mapping past the window, 4 victim took a live slot, 5 a copy did not land, 6 a slot a hit read is not its block's bytes)"
     );
 }
 
@@ -737,10 +741,11 @@ pub(crate) fn release(_id: u32) {
 }
 
 /// The per-step resolve node, built between the selection and the attention it feeds
-/// (`sparse_paged`): reads the selection rows and positions, rewrites the block table in
-/// place and pulls the claimed blocks host -> slot. `None` (no node, an untouched graph)
-/// unless the device's state is built. A device-only op: on the CPU there is no host
-/// tier, no registration, and the body is a pass-through kept for the op contract.
+/// (`sparse_paged`): reads the selection rows and positions, fills the window's residency map
+/// and pulls the claimed blocks host -> slot. It never writes the block table, so no other
+/// reader of that table can be affected by it. `None` (no node, an untouched graph) unless a
+/// pool registered a state. A device-only op: on the CPU there is no host tier, no
+/// registration, and the body is a pass-through kept for the op contract.
 #[cfg(feature = "cuda")]
 pub(crate) fn node<'a>(
     ctx: &'a crate::ggml::Context,

@@ -3,21 +3,30 @@
 // measured basis: §5.3).
 //
 // On a pool with a host tier, the pool's first `w` blocks are the slot window (reserved out
-// of allocation, so every sequence's block is a host-backed identity id). Before an
+// of allocation, so no sequence is ever handed an id that a mapping could name). Before an
 // attention launch, `legion_kv_slots_graph` runs the model's resolve as two captured,
 // synchronization-free kernels on the step's stream:
 //   resolve_kernel - one block, phases with barriers, the model's walk step for step:
-//     drain the released ids, protect the step's write spans, walk the selections (hits mark
-//     the clock, misses claim once), the second-chance clock picks victims that never take a
-//     slot the live table or this call needs, every walked table cell is re-pointed to its
-//     block's slot, and the copy list (block, slot) is left in device memory.
+//     drain the released ids, protect the step's write spans (refreshing a span block that is
+//     resident: the write-through, §4.10.3), walk the selections (hits mark the clock, misses
+//     claim once, and a block below the tier boundary is never claimed - paging bytes that
+//     never crossed the link buys nothing), then the second-chance clock picks victims that
+//     take no slot this step reads.
 //   copy_kernel - fixed grid, exits on the device count: each entry copies its block's K and
-//     V rows host-identity -> slot, per segment (the registered pool bases). Same tiered
-//     virtual range on both sides, so a copy is a plain device copy; a block this step
-//     writes is never a claim, so a slot's bytes never go stale (§4.10.3).
+//     V rows authority -> slot, per segment (the registered pool bases). Same tiered virtual
+//     range on both sides, so a copy is a plain device copy. It then checks the sampled hits
+//     against their authority and retires any mapping that no longer matches.
 //
-// The state is per device (the registry pattern of cvec.cu), built at pool-build time and
-// read by every later launch and capture: the graphs bake no address the load could move.
+// `residency` (block -> slot, -1: read the authority) is the only truth, and it is read by
+// the attention itself. **The block table is never written**, so no other reader of it -
+// another layer, another pool, a future path - can be affected by this one. That also means
+// a slot taken from a block needs no fixing anywhere else: `residency` clears in the same
+// breath, and the next reader falls back to the authority.
+//
+// The state is per pool, reached by the base address of its cache tensors: a device holds more
+// than one pool (the MTP head's cache lives on the last stage's device), and reading the
+// target's map for the drafter's blocks would answer "resident" for slots that never held
+// them. It is built at pool-build time and read by every later launch and capture.
 // The release ring is pinned: the engine writes freed ids between steps (one writer: the
 // worker that owns the pool), and every resolve drains it before walking.
 
@@ -25,6 +34,7 @@
 
 #include <cstdint>
 #include <map>
+#include <mutex>
 
 namespace {
 
@@ -45,7 +55,8 @@ struct ReleaseRing {
     // The first broken invariant, with the ids, for the reporter to print once. 1: an entry
     // in a selection names a slot nobody claimed (a foreign state rewrote this table). 2: an
     // entry resolves outside the pool. 3: a resident mapping points past the window. 4: a
-    // victim took a slot the walk had already read this call.
+    // victim took a slot the walk had already read this call. 5: a copy did not land. 6: a
+    // slot a hit read does not hold its block's bytes - the mapping went stale somewhere.
     volatile int bad_kind;
     volatile long long bad[4];
     static const int R = 1 << 16;
@@ -72,6 +83,8 @@ struct Slots {
     int32_t* claimed_mark = nullptr;   // (n_blocks) claim dedup (int: atomicExch)
     int32_t* span_list = nullptr;      // (copy_max) this call's write-span blocks
     int32_t* span_count = nullptr;
+    int2* verify_list = nullptr;       // (copy_max) sampled hits, checked against the authority
+    int32_t* verify_count = nullptr;
     int32_t* ref_epoch = nullptr;      // (w) the resolve epoch that last read each slot
     int32_t* meta = nullptr;           // [0] the clock hand, [1] the epoch: device-persistent
     Seg* segs = nullptr;               // (n_segs) the copy targets
@@ -102,6 +115,7 @@ void free_state(Slots& s) {
     cudaFree(s.copy_count);  cudaFree(s.refresh_count); cudaFree(s.protected_mark);
     cudaFree(s.claimed_mark); cudaFree(s.ref_epoch);
     cudaFree(s.span_list); cudaFree(s.span_count);
+    cudaFree(s.verify_list); cudaFree(s.verify_count);
     cudaFree(s.meta);        cudaFree(s.segs);
     if (s.ring) cudaFreeHost(s.ring);
     s = Slots{};
@@ -114,6 +128,15 @@ std::map<int, Slots> g_slots;
 /// stage's device, and reading the target's remap for its blocks would answer "resident" for
 /// a slot that never held them.
 std::map<uintptr_t, Slots*> g_by_base;
+
+/// The lock over the two registries. `ensure` inserts (on the thread building graphs, and on
+/// every `resize_kv`), `release` runs on the allocator's thread, `read` on the reporter's,
+/// `graph` on a worker's: a map insert beside those finds is undefined, not merely racy.
+///
+/// It guards the containers, not the lifetimes: `graph` looks the state up under it and then
+/// launches outside, so a rebuild still has to wait for nothing to be executing (what
+/// `resize_kv` does by dropping the graphs first). That part is not solvable here.
+std::mutex g_mu;
 
 constexpr int RT = 1024;
 constexpr long long COPY_STRIDE = 64 * 1024;
@@ -141,6 +164,7 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
         if (sh_flush) s.ring->consumed = produce;  // what never got queued: covered below
         *s.refresh_count = 0;
         *s.span_count = 0;
+        *s.verify_count = 0;
         sh_epoch = ++s.meta[1];
     }
     __syncthreads();
@@ -215,6 +239,16 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
             // reader would fall back to the authority.
             s.slot_ref[v] = 1;
             atomicAdd(&s.ctl[C_HITS], 1ULL);
+            // Sample a fraction of the hits for the check in the copy kernel. This is the
+            // one property the whole design rests on - a slot's bytes are its block's bytes
+            // - and a stale slot is a wrong read that no counter shows. The hash spreads the
+            // samples across blocks and across steps, so a write that fails to refresh is
+            // caught within a few hundred reads of happening.
+            unsigned h = ((unsigned)b * 2654435761u) ^ ((unsigned)epoch * 40503u);
+            if ((h & 1023u) == 0u) {
+                int at = atomicAdd(s.verify_count, 1);
+                if (at < s.copy_max) s.verify_list[at] = make_int2((int)b, (int)v);
+            }
             continue;
         }
         // A block below the tier boundary is device memory already: claiming it spends a
@@ -299,35 +333,78 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
         for (int i = 0; i < N_CTL; i++) s.ring->ctl_mirror[i] = s.ctl[i];
 }
 
+/// Bytes compared at each end of a sampled block. A slot that went stale because a write
+/// never reached it differs at its tail; a slot answering for the wrong block differs
+/// everywhere. Checking both ends covers the practical cases for a fraction of one copy.
+constexpr long long CHECK_ENDS = 16 * 1024;
+
+/// Whether this thread's slice of one segment differs between block `a` and slot `b`.
+__device__ __forceinline__ bool seg_differs(const Seg& sg, long long a, long long b) {
+    const unsigned char* pa = (const unsigned char*)sg.base + a * sg.bytes;
+    const unsigned char* pb = (const unsigned char*)sg.base + b * sg.bytes;
+    const long long head = min(CHECK_ENDS, sg.bytes);
+    const long long tail = min(CHECK_ENDS, sg.bytes - head);  // never the same bytes twice
+    for (long long i = (long long)threadIdx.x * 16; i < head + tail;
+         i += (long long)blockDim.x * 16) {
+        const long long o = i < head ? i : sg.bytes - tail + (i - head);
+        const uint4 x = *(const uint4*)(pa + o);
+        const uint4 y = *(const uint4*)(pb + o);
+        if (x.x != y.x || x.y != y.y || x.z != y.z || x.w != y.w) return true;
+    }
+    return false;
+}
+
 /// One CTA moves `copy_stride` bytes of one claimed block across all segments (a loop: the
-/// segment count is a few dozen at most). Exits on the device count, so the fixed grid is
-/// free on a warm step.
+/// segment count is a few dozen at most), then checks the sampled hits. Exits on the device
+/// counts, so the fixed grid is free on a warm step.
 __global__ void copy_kernel(Slots s) {
     const int c = blockIdx.y;
-    if (c >= *s.copy_count) return;
-    int2 w = s.copy_list[c];
-    long long off = (long long)blockIdx.x * s.copy_stride;
-    for (int g = 0; g < s.n_segs; g++) {
-        const Seg& sg = s.segs[g];
-        if (off >= sg.bytes) continue;
-        long long n = min(s.copy_stride, sg.bytes - off);
-        const uint4* src = (const uint4*)(sg.base + (long long)w.x * sg.bytes + off);
-        uint4* dst = (uint4*)(sg.base + (long long)w.y * sg.bytes + off);
-        for (long long i = threadIdx.x; i * 16 < n; i += blockDim.x) {
-            const uint4 v = src[i];
-            dst[i] = v;
-            // The design rests on one thing: a slot's bytes equal the authority's. Check it
-            // where it is made true - a slot that answers with another block's content is a
-            // wrong read, and no hit rate says so.
-            uint4 back = dst[i];
-            if (back.x != v.x || back.y != v.y || back.z != v.z || back.w != v.w) {
-                if (s.ring->bad_kind == 0) {
-                    s.ring->bad[0] = w.x;
-                    s.ring->bad[1] = w.y;
-                    s.ring->bad_kind = 5;
+    const int nc = *s.copy_count;
+    if (c < nc) {
+        int2 w = s.copy_list[c];
+        long long off = (long long)blockIdx.x * s.copy_stride;
+        for (int g = 0; g < s.n_segs; g++) {
+            const Seg& sg = s.segs[g];
+            if (off >= sg.bytes) continue;
+            long long n = min(s.copy_stride, sg.bytes - off);
+            const uint4* src = (const uint4*)(sg.base + (long long)w.x * sg.bytes + off);
+            uint4* dst = (uint4*)(sg.base + (long long)w.y * sg.bytes + off);
+            for (long long i = threadIdx.x; i * 16 < n; i += blockDim.x) {
+                const uint4 v = src[i];
+                dst[i] = v;
+                // Only that the write landed: reading back what was just stored cannot show
+                // a wrong source. The check of the mapping itself is below, where a hit is
+                // compared with its authority.
+                uint4 back = dst[i];
+                if (back.x != v.x || back.y != v.y || back.z != v.z || back.w != v.w) {
+                    if (s.ring->bad_kind == 0) {
+                        s.ring->bad[0] = w.x;
+                        s.ring->bad[1] = w.y;
+                        s.ring->bad_kind = 5;
+                    }
                 }
             }
         }
+        return;
+    }
+    // The check a hit asked for: does the slot still hold its block's bytes? One CTA per
+    // pair. If it does not, the mapping is retired on the spot - every later read of that
+    // block falls back to the authority - and the first such pair is reported. So a stale
+    // slot costs one wrong read at most, and the run says whether it happened at all.
+    const int vi = c - nc;
+    if (vi >= *s.verify_count || blockIdx.x != 0) return;
+    int2 p = s.verify_list[vi];
+    __shared__ int sh_diff;
+    if (threadIdx.x == 0) sh_diff = 0;
+    __syncthreads();
+    bool differ = false;
+    for (int g = 0; g < s.n_segs; g++)
+        if (seg_differs(s.segs[g], p.x, p.y)) differ = true;
+    if (differ) atomicOr(&sh_diff, 1);
+    __syncthreads();
+    if (sh_diff != 0) {
+        s.residency[p.x] = -1;
+        bad(s, 6, p.x, p.y);
     }
 }
 
@@ -340,6 +417,12 @@ extern "C" {
 /// claim-list cap. A CUDA error code, 0 for good.
 int legion_kv_slots_ensure(int dev, long long w, long long n_blocks, long long hbm,
                            long long cell_space, const Seg* segs, int n_segs, int copy_max) {
+    // The copy and the hit check both move `uint4`: a block whose bytes are not a whole
+    // number of vectors, a base that is not vector-aligned, or a window wider than the pool
+    // would read out of step rather than fail. Refuse the build; the caller logs it.
+    if (w <= 0 || n_blocks <= 0 || w > n_blocks || n_segs <= 0 || copy_max <= 0) return 4;
+    for (int i = 0; i < n_segs; i++)
+        if (segs[i].base % 16 || segs[i].bytes % 16) return 4;
     Slots s;
     s.dev = dev;
     s.w = w;
@@ -367,6 +450,8 @@ int legion_kv_slots_ensure(int dev, long long w, long long n_blocks, long long h
               cudaMalloc((void**)&s.claimed_mark, n_blocks * 4) == cudaSuccess &&
               cudaMalloc((void**)&s.span_list, copy_max * 4) == cudaSuccess &&
               cudaMalloc((void**)&s.span_count, 4) == cudaSuccess &&
+              cudaMalloc((void**)&s.verify_list, copy_max * sizeof(int2)) == cudaSuccess &&
+              cudaMalloc((void**)&s.verify_count, 4) == cudaSuccess &&
               cudaMalloc((void**)&s.ref_epoch, w * 4) == cudaSuccess &&
               cudaMalloc((void**)&s.meta, 8) == cudaSuccess &&
               cudaMalloc((void**)&s.segs, n_segs * sizeof(Seg)) == cudaSuccess &&
@@ -409,6 +494,7 @@ int legion_kv_slots_ensure(int dev, long long w, long long n_blocks, long long h
 /// drops and counts - the walk would then read a stale slot for a re-used id, which the
 /// count makes visible where it matters.
 void legion_kv_slots_release(int id) {
+    std::lock_guard<std::mutex> lock(g_mu);
     for (auto& kv : g_slots) {
         ReleaseRing* r = kv.second.ring;
         unsigned long long p = r->produce;
@@ -427,9 +513,14 @@ void legion_kv_slots_release(int id) {
 void legion_kv_slots_graph(const int* sel, long long sel_nb1, int* tab, long long tab_nb1,
                            const int* pos, int rows, int n_tok, int seqs, int dev,
                            void* stream) {
-    const auto it = g_slots.find(dev);
-    if (it == g_slots.end()) return;
-    Slots& s = it->second;
+    Slots* state = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        const auto it = g_slots.find(dev);
+        if (it != g_slots.end()) state = &it->second;
+    }
+    if (!state) return;
+    Slots& s = *state;
     resolve_kernel<<<1, RT, 0, (cudaStream_t)stream>>>(
         (int32_t*)sel, sel_nb1, tab, tab_nb1, pos, rows, n_tok, seqs, s);
     dim3 grid(s.copy_chunks, s.copy_max);
@@ -440,12 +531,14 @@ void legion_kv_slots_graph(const int* sel, long long sel_nb1, int* tab, long lon
 /// id through. Null when that pool has no window (and for the drafter's cache), which is the
 /// reader's "off": no branch, no extra load.
 const int* legion_kv_slots_remap_for(unsigned long long base) {
+    std::lock_guard<std::mutex> lock(g_mu);
     const auto it = g_by_base.find((uintptr_t)base);
     return it == g_by_base.end() ? nullptr : it->second->residency;
 }
 
 /// Copies the counters out (the reporter's readback): N_CTL u64. 3: no state.
 int legion_kv_slots_read(int dev, unsigned long long* ctl) {
+    std::lock_guard<std::mutex> lock(g_mu);
     const auto it = g_slots.find(dev);
     if (it == g_slots.end()) return 3;
     // The kernel-mirrored copy: plain memory, no CUDA sync (safe on any thread).
