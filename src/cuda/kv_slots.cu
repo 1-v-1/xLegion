@@ -62,15 +62,30 @@ struct Slots {
     int32_t* protected_mark = nullptr; // (n_blocks) the step's write spans (int: atomicExch)
     uint8_t* claimed_mark = nullptr;   // (n_blocks) claim dedup
     uint8_t* requested = nullptr;      // (cell_space) table cells to re-point
-    uint8_t* referenced = nullptr;     // (w) slots the live table points at
+    int32_t* ref_epoch = nullptr;      // (w) the resolve epoch that last read each slot
+    int32_t* meta = nullptr;           // [0] the clock hand, [1] the epoch: device-persistent
     Seg* segs = nullptr;               // (n_segs) the copy targets
     int n_segs = 0;
     int copy_max = 0;          // the claim list's cap (the caller bounds it per graph)
     long long copy_stride = 0; // bytes one copy CTA moves per segment
     int copy_chunks = 0;       // grid.x of the copy kernel
-    long long hand = 0;        // the clock hand (the resolve kernel is one block)
+    // The clock hand lives in `meta` on the device: `Slots` goes into the kernel by value,
+    // so a host-side hand would restart every call at slot 0 and the clock would degrade to
+    // "always scan from the front".
     ReleaseRing* ring = nullptr; // pinned, host-visible
 };
+
+/// Drop a pool's device state. `register` runs again on every `resize_kv` (the ids moved),
+/// so a rebuild is not a rare path: everything the build allocated goes here.
+void free_state(Slots& s) {
+    cudaFree(s.residency);   cudaFree(s.slot_block); cudaFree(s.slot_ref);
+    cudaFree(s.ctl);         cudaFree(s.claim_list); cudaFree(s.copy_list);
+    cudaFree(s.copy_count);  cudaFree(s.refresh_count); cudaFree(s.protected_mark);
+    cudaFree(s.claimed_mark); cudaFree(s.requested); cudaFree(s.ref_epoch);
+    cudaFree(s.meta);        cudaFree(s.segs);
+    if (s.ring) cudaFreeHost(s.ring);
+    s = Slots{};
+}
 
 std::map<int, Slots> g_slots;
 
@@ -91,13 +106,20 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
     const int tid = threadIdx.x;
     const int nt = max(n_tok, 1);
     const int n_seqs = max(rows / nt, 1);
+    __shared__ int sh_epoch;
 
-    // 0. Drain the released ids (§4.10.6). One thread: releases are rare and few.
+    // 0. Drain the released ids (§4.10.6) and open this call's epoch. One thread; releases
+    // are rare and few. The epoch is what makes "a slot this step reads" cheap to stamp:
+    // the layers that call this need no array cleared between them (§4.10.5).
     if (tid == 0) {
         unsigned long long produce = s.ring->produce;
         while (s.ring->consumed < produce)
             s.residency[s.ring->ids[(s.ring->consumed++) % ReleaseRing::R]] = -1;
+        *s.refresh_count = 0;
+        sh_epoch = ++s.meta[1];
     }
+    __syncthreads();
+    const int epoch = sh_epoch;
 
     // 1. Protect the blocks this step's tokens write (§4.10.3): never a claim. The span's
     // table entries are identity ids by that same rule, so no indirection is needed. A span
@@ -106,8 +128,6 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
     // for a claim: an entry re-pointed at a slot the step still has to write would read the
     // step's own old bytes. Where the list cannot hold it, the copy is dropped and the block
     // stops being a slot, so the entry stays an identity read.
-    if (tid == 0) *s.refresh_count = 0;
-    __syncthreads();
     for (int i = tid; i < n_seqs * nt; i += RT) {
         int p = pos[i / nt] + i % nt;
         long long cell = (long long)(i / nt) * tab_nb1 + p / 64;
@@ -116,6 +136,7 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
         if (atomicExch(&s.protected_mark[e], 1) != 0) continue;  // the first touch queues it
         int r = s.residency[e];
         if (r < 0) continue;
+        s.ref_epoch[r] = epoch;  // read by this step's attention: off-limits to victims
         int at = atomicAdd(s.refresh_count, 1);
         if (at < s.copy_max) s.copy_list[at] = make_int2(e, r);
         else s.residency[e] = -1;
@@ -147,12 +168,14 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
             }
             s.requested[cell] = 1;  // refreshed above: the slot holds the bytes to read
             s.slot_ref[v] = 1;
+            s.ref_epoch[v] = epoch;
             atomicAdd(&s.ctl[C_HITS], 1ULL);
             continue;
         }
         s.requested[cell] = 1;
         if (v >= 0) {
             s.slot_ref[v] = 1;
+            s.ref_epoch[v] = epoch;
             atomicAdd(&s.ctl[C_HITS], 1ULL);
             continue;
         }
@@ -175,25 +198,22 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
     if (tid == 0) {
         int n_claims = min(*s.copy_count, s.copy_max);
         int nr = min(*s.refresh_count, s.copy_max);
-        for (long long v = 0; v < s.w; v++) s.referenced[v] = 0;
-        for (long long c = 0; c < (long long)n_seqs * tab_nb1; c++) {
-            int e = tab[c];
-            if (e >= 0 && e < s.w) s.referenced[e] = 1;
-        }
-        // A refreshed slot is read by this step's attention: off-limits to victims.
-        for (int i = 0; i < nr; i++) s.referenced[s.copy_list[i].y] = 1;
+        // Nothing to clear and no table to scan: the walk and the refresh already stamped
+        // every slot this step reads with the epoch. The hand is the device's, so the clock
+        // actually moves between calls.
+        long long hand = s.meta[0];
         int out = nr;
         for (int i = 0; i < n_claims; i++) {
             long long b = s.claim_list[i];
             long long taken = -1;
             for (int tries = 0; tries < 2 * (int)s.w; tries++) {
-                long long v = s.hand;
-                s.hand = (s.hand + 1) % max((int)s.w, 1);
+                long long v = hand;
+                hand = (hand + 1) % max((int)s.w, 1);
                 if (s.slot_ref[v]) {
                     s.slot_ref[v] = 0;
                     continue;
                 }
-                if (s.referenced[v]) continue;
+                if (s.ref_epoch[v] == epoch) continue;
                 unsigned long long old = s.slot_block[v];
                 if (old != 0 && s.residency[old - 1] == (int32_t)v) {
                     s.residency[old - 1] = -1;
@@ -209,10 +229,11 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
             s.residency[b] = (int32_t)taken;
             s.slot_block[taken] = (uint32_t)(b + 1);
             s.slot_ref[taken] = 1;
-            s.referenced[taken] = 1;
+            s.ref_epoch[taken] = epoch;
             s.copy_list[out++] = make_int2((int)b, (int)taken);
             atomicAdd(&s.ctl[C_MISSES], 1ULL);
         }
+        s.meta[0] = (int32_t)hand;
         *s.copy_count = out;
     }
     __syncthreads();
@@ -296,7 +317,8 @@ int legion_kv_slots_ensure(int dev, long long w, long long n_blocks, long long c
               cudaMalloc((void**)&s.protected_mark, n_blocks * 4) == cudaSuccess &&
               cudaMalloc((void**)&s.claimed_mark, n_blocks) == cudaSuccess &&
               cudaMalloc((void**)&s.requested, cell_space) == cudaSuccess &&
-              cudaMalloc((void**)&s.referenced, w) == cudaSuccess &&
+              cudaMalloc((void**)&s.ref_epoch, w * 4) == cudaSuccess &&
+              cudaMalloc((void**)&s.meta, 8) == cudaSuccess &&
               cudaMalloc((void**)&s.segs, n_segs * sizeof(Seg)) == cudaSuccess &&
               cudaHostAlloc((void**)&s.ring, sizeof(ReleaseRing), cudaHostAllocMapped) == cudaSuccess;
     ok = ok && cudaMemset(s.residency, 0xff, n_blocks * 4) == cudaSuccess &&
@@ -307,13 +329,15 @@ int legion_kv_slots_ensure(int dev, long long w, long long n_blocks, long long c
          cudaMemset(s.refresh_count, 0, 4) == cudaSuccess &&
          cudaMemset(s.protected_mark, 0, n_blocks * 4) == cudaSuccess &&
          cudaMemset(s.claimed_mark, 0, n_blocks) == cudaSuccess &&
-         cudaMemset(s.requested, 0, cell_space) == cudaSuccess;
+         cudaMemset(s.requested, 0, cell_space) == cudaSuccess &&
+         cudaMemset(s.ref_epoch, 0, w * 4) == cudaSuccess &&
+         cudaMemset(s.meta, 0, 8) == cudaSuccess;
     if (ok) {
         s.ring->produce = 0;
         s.ring->consumed = 0;
         cudaMemcpy(s.segs, segs, n_segs * sizeof(Seg), cudaMemcpyHostToDevice);
         Slots& into = g_slots[dev];
-        if (into.residency) cudaFree(into.residency); // a rebuild: drop the old state
+        if (into.residency) free_state(into);  // a rebuild: the ids moved
         into = s;
     }
     cudaSetDevice(prev);

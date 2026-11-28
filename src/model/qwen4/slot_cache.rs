@@ -153,15 +153,17 @@ impl SlotState {
             }
         }
         // The refreshed blocks lead the copy list: the attention that runs after this step's
-        // write then reads them from the slot, at every layer of the step.
+        // write then reads them from the slot, at every layer of the step. The slots it
+        // names are read this step, so no victim may take them.
+        let mut referenced = vec![false; self.w];
         let mut copies: Vec<(u32, u32)> = Vec::new();
         for &b in &span {
             let r = self.residency[b];
             if r >= 0 {
                 copies.push((b as u32, r as u32));
+                referenced[r as usize] = true;
             }
         }
-        let refresh = copies.len();
 
         // 3. Walk the selections: hits mark their clock bit; each miss's block is claimed
         // once. The positions ascend (the `qsa_attn` op's sel format), so a block's cells
@@ -198,12 +200,14 @@ impl SlotState {
                     }
                     rewrites.push(blk);
                     self.slot_ref[r as usize] = 1;
+                    referenced[r as usize] = true;
                     self.ctl.hits += 1;
                     continue;
                 }
                 rewrites.push(blk);
                 if r >= 0 {
                     self.slot_ref[r as usize] = 1;
+                    referenced[r as usize] = true;
                     self.ctl.hits += 1;
                     continue;
                 }
@@ -214,19 +218,12 @@ impl SlotState {
             }
         }
 
-        // 4. Victims: second chance, never a slot the live table references (any entry
-        // pointing there reads its bytes), never one this call already handed out. A window
-        // with nothing freeable leaves the miss uncached (correct, counted, no stall).
-        let mut referenced = vec![false; self.w];
-        for t in table.iter().take(n_seqs * tab_nb1) {
-            if *t >= 0 && (*t as usize) < self.w {
-                referenced[*t as usize] = true;
-            }
-        }
-        // A refreshed slot is read by this step's attention: it is off-limits to victims.
-        for &(_, v) in copies.iter().take(refresh) {
-            referenced[v as usize] = true;
-        }
+        // 4. Victims: second chance, never a slot this step reads - the walk named the ones
+        // its attention will hit, the refresh named the write spans - and never one this
+        // call already handed out. A window with nothing freeable leaves the miss uncached
+        // (correct, counted, no stall). `referenced` holds exactly that set: the host refills
+        // the identity table before every step, so the only entries pointing at a slot are
+        // ones this step wrote, and every one of them is a cell the walk walked over.
         for &b in &claim {
             let mut taken = None;
             for _ in 0..2 * self.w {
