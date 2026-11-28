@@ -58,7 +58,8 @@ struct Slots {
     int32_t* claim_list = nullptr;  // (copy_max) this call's claims (block ids)
     int2* copy_list = nullptr;      // (copy_max) (block, slot) per claimed copy
     int32_t* copy_count = nullptr;  // device count the copy kernel reads
-    uint8_t* protected_mark = nullptr; // (n_blocks) the step's write spans
+    int32_t* refresh_count = nullptr; // the write-through copies, queued first, never dropped
+    int32_t* protected_mark = nullptr; // (n_blocks) the step's write spans (int: atomicExch)
     uint8_t* claimed_mark = nullptr;   // (n_blocks) claim dedup
     uint8_t* requested = nullptr;      // (cell_space) table cells to re-point
     uint8_t* referenced = nullptr;     // (w) slots the live table points at
@@ -98,13 +99,26 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
             s.residency[s.ring->ids[(s.ring->consumed++) % ReleaseRing::R]] = -1;
     }
 
-    // 1. Protect the blocks this step's tokens write (§4.10.3). The span's table entries are
-    // identity ids by that same rule, so no indirection is needed.
+    // 1. Protect the blocks this step's tokens write (§4.10.3): never a claim. The span's
+    // table entries are identity ids by that same rule, so no indirection is needed. A span
+    // block already resident has its slot refreshed - the write-through (G4) that keeps a
+    // resident copy from going stale, queued at the front of the copy list and never dropped
+    // for a claim: an entry re-pointed at a slot the step still has to write would read the
+    // step's own old bytes. Where the list cannot hold it, the copy is dropped and the block
+    // stops being a slot, so the entry stays an identity read.
+    if (tid == 0) *s.refresh_count = 0;
+    __syncthreads();
     for (int i = tid; i < n_seqs * nt; i += RT) {
         int p = pos[i / nt] + i % nt;
         long long cell = (long long)(i / nt) * tab_nb1 + p / 64;
         int e = tab[cell];
-        if (e >= 0 && e < s.n_blocks) s.protected_mark[e] = 1;
+        if (e < 0 || e >= s.n_blocks) continue;
+        if (atomicExch(&s.protected_mark[e], 1) != 0) continue;  // the first touch queues it
+        int r = s.residency[e];
+        if (r < 0) continue;
+        int at = atomicAdd(s.refresh_count, 1);
+        if (at < s.copy_max) s.copy_list[at] = make_int2(e, r);
+        else s.residency[e] = -1;
     }
     __syncthreads();
 
@@ -125,12 +139,18 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
         long long cell = (long long)seq * tab_nb1 + p / 64;
         long long b = entry_block(tab[cell], s.w, s.slot_block);
         if (b < 0 || b >= s.n_blocks) continue;
+        int32_t v = s.residency[b];
         if (s.protected_mark[b]) {
-            atomicAdd(&s.ctl[C_PROTECTED], 1ULL);
+            if (v < 0) {
+                atomicAdd(&s.ctl[C_PROTECTED], 1ULL);
+                continue;
+            }
+            s.requested[cell] = 1;  // refreshed above: the slot holds the bytes to read
+            s.slot_ref[v] = 1;
+            atomicAdd(&s.ctl[C_HITS], 1ULL);
             continue;
         }
         s.requested[cell] = 1;
-        int32_t v = s.residency[b];
         if (v >= 0) {
             s.slot_ref[v] = 1;
             atomicAdd(&s.ctl[C_HITS], 1ULL);
@@ -154,12 +174,15 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
     // few (a warm step has none), and the first cold step pays one thread over the window.
     if (tid == 0) {
         int n_claims = min(*s.copy_count, s.copy_max);
+        int nr = min(*s.refresh_count, s.copy_max);
         for (long long v = 0; v < s.w; v++) s.referenced[v] = 0;
         for (long long c = 0; c < (long long)n_seqs * tab_nb1; c++) {
             int e = tab[c];
             if (e >= 0 && e < s.w) s.referenced[e] = 1;
         }
-        int out = 0;
+        // A refreshed slot is read by this step's attention: off-limits to victims.
+        for (int i = 0; i < nr; i++) s.referenced[s.copy_list[i].y] = 1;
+        int out = nr;
         for (int i = 0; i < n_claims; i++) {
             long long b = s.claim_list[i];
             long long taken = -1;
@@ -179,7 +202,7 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
                 taken = v;
                 break;
             }
-            if (taken < 0) {
+            if (taken < 0 || out >= s.copy_max) {
                 atomicAdd(&s.ctl[C_OVERFLOW], 1ULL);
                 continue;
             }
@@ -206,7 +229,9 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
     }
     for (int i = tid; i < n_seqs * nt; i += RT) {
         int p = pos[i / nt] + i % nt;
-        int e = tab[(long long)(i / nt) * tab_nb1 + p / 64];
+        // The entry may now point at the slot this block was refreshed into; `slot_block`
+        // names the block either way.
+        long long e = entry_block(tab[(long long)(i / nt) * tab_nb1 + p / 64], s.w, s.slot_block);
         if (e >= 0 && e < s.n_blocks) s.protected_mark[e] = 0;
     }
     int n_claims = min(*s.copy_count, s.copy_max);
@@ -267,7 +292,8 @@ int legion_kv_slots_ensure(int dev, long long w, long long n_blocks, long long c
               cudaMalloc((void**)&s.claim_list, copy_max * 4) == cudaSuccess &&
               cudaMalloc((void**)&s.copy_list, copy_max * sizeof(int2)) == cudaSuccess &&
               cudaMalloc((void**)&s.copy_count, 4) == cudaSuccess &&
-              cudaMalloc((void**)&s.protected_mark, n_blocks) == cudaSuccess &&
+              cudaMalloc((void**)&s.refresh_count, 4) == cudaSuccess &&
+              cudaMalloc((void**)&s.protected_mark, n_blocks * 4) == cudaSuccess &&
               cudaMalloc((void**)&s.claimed_mark, n_blocks) == cudaSuccess &&
               cudaMalloc((void**)&s.requested, cell_space) == cudaSuccess &&
               cudaMalloc((void**)&s.referenced, w) == cudaSuccess &&
@@ -278,7 +304,8 @@ int legion_kv_slots_ensure(int dev, long long w, long long n_blocks, long long c
          cudaMemset(s.slot_ref, 0, w) == cudaSuccess &&
          cudaMemset(s.ctl, 0, N_CTL * 8) == cudaSuccess &&
          cudaMemset(s.copy_count, 0, 4) == cudaSuccess &&
-         cudaMemset(s.protected_mark, 0, n_blocks) == cudaSuccess &&
+         cudaMemset(s.refresh_count, 0, 4) == cudaSuccess &&
+         cudaMemset(s.protected_mark, 0, n_blocks * 4) == cudaSuccess &&
          cudaMemset(s.claimed_mark, 0, n_blocks) == cudaSuccess &&
          cudaMemset(s.requested, 0, cell_space) == cudaSuccess;
     if (ok) {
