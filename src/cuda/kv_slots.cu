@@ -40,6 +40,8 @@ struct ReleaseRing {
     volatile unsigned long long produce;
     volatile unsigned long long consumed;
     volatile unsigned long long ctl_mirror[6]; // = N_CTL, mirrored by the resolve kernel
+    volatile unsigned long long drops;         // host-side: a full ring forced a flush
+    volatile int flush_all;                    // set by the producer, drained by the resolve
     static const int R = 1 << 16;
     volatile int ids[R];
 };
@@ -60,7 +62,9 @@ struct Slots {
     int32_t* copy_count = nullptr;  // device count the copy kernel reads
     int32_t* refresh_count = nullptr; // the write-through copies, queued first, never dropped
     int32_t* protected_mark = nullptr; // (n_blocks) the step's write spans (int: atomicExch)
-    uint8_t* claimed_mark = nullptr;   // (n_blocks) claim dedup
+    int32_t* claimed_mark = nullptr;   // (n_blocks) claim dedup (int: atomicExch)
+    int32_t* span_list = nullptr;      // (copy_max) this call's write-span blocks
+    int32_t* span_count = nullptr;
     uint8_t* requested = nullptr;      // (cell_space) table cells to re-point
     int32_t* ref_epoch = nullptr;      // (w) the resolve epoch that last read each slot
     int32_t* meta = nullptr;           // [0] the clock hand, [1] the epoch: device-persistent
@@ -82,6 +86,7 @@ void free_state(Slots& s) {
     cudaFree(s.ctl);         cudaFree(s.claim_list); cudaFree(s.copy_list);
     cudaFree(s.copy_count);  cudaFree(s.refresh_count); cudaFree(s.protected_mark);
     cudaFree(s.claimed_mark); cudaFree(s.requested); cudaFree(s.ref_epoch);
+    cudaFree(s.span_list); cudaFree(s.span_count);
     cudaFree(s.meta);        cudaFree(s.segs);
     if (s.ring) cudaFreeHost(s.ring);
     s = Slots{};
@@ -95,6 +100,7 @@ constexpr long long COPY_STRIDE = 64 * 1024;
 /// The model's `entry_block`: at-or-above `w` the entry is its own block; below, the slot's
 /// `slot_block` names whose bytes it holds. A never-claimed slot (`0`) maps to nothing.
 __device__ __forceinline__ long long entry_block(int entry, long long w, const uint32_t* slot_block) {
+    if (entry < 0) return -1;   // a padded or unset entry: no block, never an index
     if (entry >= w) return entry;
     unsigned long long b = slot_block[entry];
     return b == 0 ? -1 : (long long)(b - 1);
@@ -102,24 +108,47 @@ __device__ __forceinline__ long long entry_block(int entry, long long w, const u
 
 __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int32_t* __restrict__ tab,
                                long long tab_nb1, const int* __restrict__ pos, int rows, int n_tok,
-                               Slots s) {
+                               int seqs, Slots s) {
     const int tid = threadIdx.x;
     const int nt = max(n_tok, 1);
-    const int n_seqs = max(rows / nt, 1);
+    const int n_seqs = max(seqs, 1);
     __shared__ int sh_epoch;
+    __shared__ int sh_flush;
+    __shared__ int sh_claims;   // step 3's claim count: copy_count ends up including refreshes
 
     // 0. Drain the released ids (§4.10.6) and open this call's epoch. One thread; releases
     // are rare and few. The epoch is what makes "a slot this step reads" cheap to stamp:
     // the layers that call this need no array cleared between them (§4.10.5).
     if (tid == 0) {
+        sh_flush = s.ring->flush_all;
         unsigned long long produce = s.ring->produce;
-        while (s.ring->consumed < produce)
-            s.residency[s.ring->ids[(s.ring->consumed++) % ReleaseRing::R]] = -1;
+        while (s.ring->consumed < produce) {
+            int id = s.ring->ids[(s.ring->consumed++) % ReleaseRing::R];
+            if (id >= 0 && id < s.n_blocks) s.residency[id] = -1;  // another pool's id: skip
+        }
+        if (sh_flush) s.ring->consumed = produce;  // what never got queued: covered below
         *s.refresh_count = 0;
+        *s.span_count = 0;
         sh_epoch = ++s.meta[1];
     }
     __syncthreads();
+    if (sh_flush) {
+        // The window goes entirely: an id we could not queue may already have been handed
+        // out again, and a slot for it would answer with the previous owner's bytes.
+        for (long long i = tid; i < s.n_blocks; i += RT) s.residency[i] = -1;
+        if (tid == 0) s.ring->flush_all = 0;
+    }
+    __syncthreads();
     const int epoch = sh_epoch;
+
+    // A1/A2 first, before anything is stamped as a block id: every slot an entry already
+    // points at is read during this step. The walk cannot cover those cells (each layer
+    // selects differently) and the table is shared by the layers, so a slot taken now leaves
+    // the entry naming bytes that belong to somebody else, with no way back.
+    for (long long c = tid; c < (long long)n_seqs * tab_nb1; c += RT) {
+        int e = tab[c];
+        if (e >= 0 && e < s.w) s.ref_epoch[e] = epoch;
+    }
 
     // 1. Protect the blocks this step's tokens write (§4.10.3): never a claim. The span's
     // table entries are identity ids by that same rule, so no indirection is needed. A span
@@ -130,16 +159,19 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
     // stops being a slot, so the entry stays an identity read.
     for (int i = tid; i < n_seqs * nt; i += RT) {
         int p = pos[i / nt] + i % nt;
+        if (p < 0 || p / 64 >= tab_nb1) continue;
         long long cell = (long long)(i / nt) * tab_nb1 + p / 64;
-        int e = tab[cell];
-        if (e < 0 || e >= s.n_blocks) continue;
-        if (atomicExch(&s.protected_mark[e], 1) != 0) continue;  // the first touch queues it
-        int r = s.residency[e];
+        long long b = entry_block(tab[cell], s.w, s.slot_block);
+        if (b < 0 || b >= s.n_blocks) continue;
+        if (atomicExch(&s.protected_mark[b], 1) != 0) continue;  // the first touch records it
+        int at = atomicAdd(s.span_count, 1);
+        if (at < s.copy_max) s.span_list[at] = (int32_t)b;
+        int r = s.residency[b];
         if (r < 0) continue;
         s.ref_epoch[r] = epoch;  // read by this step's attention: off-limits to victims
-        int at = atomicAdd(s.refresh_count, 1);
-        if (at < s.copy_max) s.copy_list[at] = make_int2(e, r);
-        else s.residency[e] = -1;
+        int q = atomicAdd(s.refresh_count, 1);
+        if (q < s.copy_max) s.copy_list[q] = make_int2((int)b, r);
+        else s.residency[b] = -1;  // cannot refresh: drop the copy rather than read it
     }
     __syncthreads();
 
@@ -179,8 +211,7 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
             atomicAdd(&s.ctl[C_HITS], 1ULL);
             continue;
         }
-        if (!s.claimed_mark[b]) {
-            s.claimed_mark[b] = 1;
+        if (atomicExch(&s.claimed_mark[b], 1) == 0) {
             int at = atomicAdd(s.copy_count, 1);
             if (at < s.copy_max)
                 s.claim_list[at] = (int32_t)b;
@@ -223,6 +254,7 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
                 break;
             }
             if (taken < 0 || out >= s.copy_max) {
+                s.claimed_mark[b] = 0;  // give the mark back: else never cached again
                 atomicAdd(&s.ctl[C_OVERFLOW], 1ULL);
                 continue;
             }
@@ -234,6 +266,7 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
             atomicAdd(&s.ctl[C_MISSES], 1ULL);
         }
         s.meta[0] = (int32_t)hand;
+        sh_claims = n_claims;
         *s.copy_count = out;
     }
     __syncthreads();
@@ -242,22 +275,20 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
     // write spans were never requested, so their entries still hold the ids marked above.
     for (long long c = tid; c < (long long)n_seqs * tab_nb1; c += RT) {
         if (!s.requested[c]) continue;
+        s.requested[c] = 0;  // cleared on every path, so no bit survives a skipped entry
         long long b = entry_block(tab[c], s.w, s.slot_block);
         if (b < 0) continue;
         int32_t v = s.residency[b];
         if (v >= 0) tab[c] = v;
-        s.requested[c] = 0;
     }
-    for (int i = tid; i < n_seqs * nt; i += RT) {
-        int p = pos[i / nt] + i % nt;
-        // The entry may now point at the slot this block was refreshed into; `slot_block`
-        // names the block either way.
-        long long e = entry_block(tab[(long long)(i / nt) * tab_nb1 + p / 64], s.w, s.slot_block);
-        if (e >= 0 && e < s.n_blocks) s.protected_mark[e] = 0;
+    // The marks go by the ids recorded above: the table entries have been rewritten since,
+    // and reading them back would name the slot's (possibly new) owner instead.
+    for (int i = tid, n = min(*s.span_count, s.copy_max); i < n; i++) {
+        int b = s.span_list[i];
+        if (b >= 0 && b < s.n_blocks) s.protected_mark[b] = 0;
     }
-    int n_claims = min(*s.copy_count, s.copy_max);
-    for (int i = tid; i < n_claims; i++) {
-        int b = s.copy_list[i].x;
+    for (int i = tid, n = sh_claims; i < n; i++) {
+        int b = s.claim_list[i];
         if (b >= 0 && b < s.n_blocks) s.claimed_mark[b] = 0;
     }
     // Mirror the counters for the host's stats poll (see ReleaseRing::ctl_mirror).
@@ -315,7 +346,9 @@ int legion_kv_slots_ensure(int dev, long long w, long long n_blocks, long long c
               cudaMalloc((void**)&s.copy_count, 4) == cudaSuccess &&
               cudaMalloc((void**)&s.refresh_count, 4) == cudaSuccess &&
               cudaMalloc((void**)&s.protected_mark, n_blocks * 4) == cudaSuccess &&
-              cudaMalloc((void**)&s.claimed_mark, n_blocks) == cudaSuccess &&
+              cudaMalloc((void**)&s.claimed_mark, n_blocks * 4) == cudaSuccess &&
+              cudaMalloc((void**)&s.span_list, copy_max * 4) == cudaSuccess &&
+              cudaMalloc((void**)&s.span_count, 4) == cudaSuccess &&
               cudaMalloc((void**)&s.requested, cell_space) == cudaSuccess &&
               cudaMalloc((void**)&s.ref_epoch, w * 4) == cudaSuccess &&
               cudaMalloc((void**)&s.meta, 8) == cudaSuccess &&
@@ -328,7 +361,8 @@ int legion_kv_slots_ensure(int dev, long long w, long long n_blocks, long long c
          cudaMemset(s.copy_count, 0, 4) == cudaSuccess &&
          cudaMemset(s.refresh_count, 0, 4) == cudaSuccess &&
          cudaMemset(s.protected_mark, 0, n_blocks * 4) == cudaSuccess &&
-         cudaMemset(s.claimed_mark, 0, n_blocks) == cudaSuccess &&
+         cudaMemset(s.claimed_mark, 0, n_blocks * 4) == cudaSuccess &&
+         cudaMemset(s.span_count, 0, 4) == cudaSuccess &&
          cudaMemset(s.requested, 0, cell_space) == cudaSuccess &&
          cudaMemset(s.ref_epoch, 0, w * 4) == cudaSuccess &&
          cudaMemset(s.meta, 0, 8) == cudaSuccess;
@@ -353,23 +387,24 @@ void legion_kv_slots_release(int id) {
         ReleaseRing* r = kv.second.ring;
         unsigned long long p = r->produce;
         if (p - r->consumed >= (unsigned long long)ReleaseRing::R) {
-            kv.second.ctl[C_DROPS]++;
+            r->drops++;  // pinned: `ctl` is device memory, and a full ring is not a crash
+            r->flush_all = 1;  // flush the window rather than lose the release
             continue;
         }
         r->ids[p % ReleaseRing::R] = id;
-        r->produce = p + 1;
+        __atomic_store_n(&r->produce, p + 1, __ATOMIC_RELEASE);
     }
 }
 
 /// The captured-graph hook: resolve, then the copy, on `stream`. Called from the
 /// `qsa_kv_slots` op with the attention node's own operands.
 void legion_kv_slots_graph(const int* sel, long long sel_nb1, int* tab, long long tab_nb1,
-                           const int* pos, int rows, int n_tok, int dev, void* stream) {
+                           const int* pos, int rows, int n_tok, int seqs, int dev, void* stream) {
     const auto it = g_slots.find(dev);
     if (it == g_slots.end()) return;
     Slots& s = it->second;
     resolve_kernel<<<1, RT, 0, (cudaStream_t)stream>>>(
-        (int32_t*)sel, sel_nb1, tab, tab_nb1, pos, rows, n_tok, s);
+        (int32_t*)sel, sel_nb1, tab, tab_nb1, pos, rows, n_tok, seqs, s);
     dim3 grid(s.copy_chunks, s.copy_max);
     copy_kernel<<<grid, 128, 0, (cudaStream_t)stream>>>(s);
 }
@@ -381,6 +416,7 @@ int legion_kv_slots_read(int dev, unsigned long long* ctl) {
     // The kernel-mirrored copy: plain memory, no CUDA sync (safe on any thread).
     const volatile unsigned long long* m = it->second.ring->ctl_mirror;
     for (int i = 0; i < N_CTL; i++) ctl[i] = m[i];
+    ctl[C_DROPS] = it->second.ring->drops;  // counted host-side, so read it from the ring
     return 0;
 }
 

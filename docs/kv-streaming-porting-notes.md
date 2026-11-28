@@ -188,6 +188,16 @@ block table、KV 写的 `cells`、`pos` 都是**每步由 host 重新填充的�
    - **仍未做**：copy 列表的容量仍是保守值 `min(n_blocks,8192).max(w)`，warm 步也要 launch `copy_chunks × copy_max` 个早退 CTA；真正的界应是 `rows × (top_k/64 + 1)`（Strata 的对应式是 `n_q × (cap/page_size + 2)`，见 §1.4）。等真机 profile 确认这一项的占比后再定标，避免拍一个过小上界反而把 claim 打成 overflow。
 
 
+10. **第二轮逐条审查的处置（2026-11-28）**。真机之前把 kernel 与模型逐阶段对了一遍，改掉的（正确性级别）：
+    - **写 span 必须经 `entry_block` 反查。** 本步前一层已可能把 span 的表项重指向 slot，直接取表项会把 **slot 号当块号**去保护：既不刷新真正的块，也丢掉 §4.10.3 的保护 → 本层 attention 经槽读到本层写之前的字节。模型与 kernel 同错，所以以模型为真值的 parity 抓不到，只有开/关对拍能抓（已补两个模型用例，各自做过变异验证）。
+    - **"victim 不许取 live table 正指向的槽"这条不能删。** 上一轮为省开销把它删了（论证是"表每步重填，指向槽的项都是本 call 写的、walk 都覆盖"）——错在**表是层间共享的、每层 selection 不同**：前层重定向的项本层不会再经过，被抢后 `slot_block` 换主、表项仍指该槽，后面的层再选中就静默读别人的字节，且无从修回。已恢复，但按并行 stamp 实现（每线程扫一段表写 `ref_epoch`），不是原来的单线程清零 + 扫表。
+    - `claimed_mark` 的 check-then-set 不是原子（protected 用了 `atomicExch`，这里没有）→ 相邻行重复 claim 同块、多占一槽、`residency`/`slot_block` 反向不变量被破坏；改 `atomicExch`。取不到 victim / 列表满时要**归还 mark**，否则该块终身不再被缓存。
+    - **release ring 满是一次正确性事件，不是统计**：丢一条释放 → 该 id 复用后仍命中旧槽 → 读到上一个持有者的 KV。现在满时置 `flush_all`，下一次 resolve 把整窗 `residency` 清 -1（丢缓存可接受，读陈旧不可接受）；顺带修掉 host 端 `ctl[C_DROPS]++` 解引用设备指针（环满即 SIGSEGV），drops 改记 pinned，host 写 `produce` 加 release 序（aarch64 无 store-store 序）。
+    - **`n_seqs` 必须由 host 传**（表的 `ne[1]`），不能用 `rows / n_tok` 反推：`rows` 非整倍数时 `n_tok` 退化成 1 → `n_seqs` 变大 → `pos`、表、`requested` 全部越界读写。另补 `p ≥ 0` 与 `p/64 < tab_nb1` 守卫、`entry_block` 的 `entry < 0` 守卫、drain 的 `id < n_blocks` 守卫（release 现在把 id 广播给所有设备）。
+    - `requested` 的位在 `continue` 分支上没清、`protected_mark` 的清除依赖**已被本 call 改写的表**反查（可能清到新主人，旧块 sticky）→ 改为 step 1 记 `span_list`、按 id 清；清理 claim 的计数也不能用 `copy_count`（它已含 refresh 项）。
+    - 口径差异记账（不当 bug 追）：kernel 的 evictions 只在映射真死时加、overflow 多两处（列表满）；claim 顺序由 `atomicAdd` 决定 → victim 分配 run-to-run 不同（输出仍逐位一致，命中率会漂）。
+    - 仍留给 hardening：`g_slots` 无锁（release 在 allocator 线程、read 在 reporter 线程、ensure 在 worker 线程）；`ensure` 失败路径漏设备内存；rebuild 与已捕获图的指针烘焙（现依赖 `resize_kv` 先 `forget_graphs`，需覆盖到 MTP/verify 的图）；`ensure` 不 assert `w ≤ n_blocks`、`Seg.bytes % 16`；copy 列表容量未按工作集定标（§4.10.9）。
+
 ## 5. 分期与决策点
 
 - **Phase 0 — 测量，先于一切实现**：插桩已实现（`LEGION_DEBUG_KV_STATS=1`，
