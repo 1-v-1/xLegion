@@ -72,7 +72,6 @@ struct Slots {
     int32_t* claimed_mark = nullptr;   // (n_blocks) claim dedup (int: atomicExch)
     int32_t* span_list = nullptr;      // (copy_max) this call's write-span blocks
     int32_t* span_count = nullptr;
-    uint8_t* requested = nullptr;      // (cell_space) table cells to re-point
     int32_t* ref_epoch = nullptr;      // (w) the resolve epoch that last read each slot
     int32_t* meta = nullptr;           // [0] the clock hand, [1] the epoch: device-persistent
     Seg* segs = nullptr;               // (n_segs) the copy targets
@@ -101,7 +100,7 @@ void free_state(Slots& s) {
     cudaFree(s.residency);   cudaFree(s.slot_block); cudaFree(s.slot_ref);
     cudaFree(s.ctl);         cudaFree(s.claim_list); cudaFree(s.copy_list);
     cudaFree(s.copy_count);  cudaFree(s.refresh_count); cudaFree(s.protected_mark);
-    cudaFree(s.claimed_mark); cudaFree(s.requested); cudaFree(s.ref_epoch);
+    cudaFree(s.claimed_mark); cudaFree(s.ref_epoch);
     cudaFree(s.span_list); cudaFree(s.span_count);
     cudaFree(s.meta);        cudaFree(s.segs);
     if (s.ring) cudaFreeHost(s.ring);
@@ -110,29 +109,18 @@ void free_state(Slots& s) {
 
 std::map<int, Slots> g_slots;
 
+/// Every cache tensor of every pool with a state, to the state that covers it. Keyed by
+/// tensor because a GPU holds more than one pool: the MTP head's cache lives on the last
+/// stage's device, and reading the target's remap for its blocks would answer "resident" for
+/// a slot that never held them.
+std::map<uintptr_t, Slots*> g_by_base;
+
 constexpr int RT = 1024;
 constexpr long long COPY_STRIDE = 64 * 1024;
 
-/// Shadow mode (host-set, baked into the launch): claim, copy and count exactly as usual,
-/// but never re-point a table entry, so every read still goes to the authority. It exists to
-/// answer one question in one run: is the wrong output caused by serving from a slot, or by
-/// something the state machine does besides that?
 __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int32_t* __restrict__ tab,
                                long long tab_nb1, const int* __restrict__ pos, int rows, int n_tok,
-                               int seqs, int shadow, Slots s);
-
-/// The model's `entry_block`: at-or-above `w` the entry is its own block; below, the slot's
-/// `slot_block` names whose bytes it holds. A never-claimed slot (`0`) maps to nothing.
-__device__ __forceinline__ long long entry_block(int entry, long long w, const uint32_t* slot_block) {
-    if (entry < 0) return -1;   // a padded or unset entry: no block, never an index
-    if (entry >= w) return entry;
-    unsigned long long b = slot_block[entry];
-    return b == 0 ? -1 : (long long)(b - 1);
-}
-
-__global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int32_t* __restrict__ tab,
-                               long long tab_nb1, const int* __restrict__ pos, int rows, int n_tok,
-                               int seqs, int shadow, Slots s) {
+                               int seqs, Slots s) {
     const int tid = threadIdx.x;
     const int nt = max(n_tok, 1);
     const int n_seqs = max(seqs, 1);
@@ -165,17 +153,6 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
     __syncthreads();
     const int epoch = sh_epoch;
 
-    // A1/A2 first, before anything is stamped as a block id: every slot an entry already
-    // points at is read during this step. The walk cannot cover those cells (each layer
-    // selects differently) and the table is shared by the layers, so a slot taken now leaves
-    // the entry naming bytes that belong to somebody else, with no way back.
-    for (long long c = tid; c < (long long)n_seqs * tab_nb1; c += RT) {
-        int e = tab[c];
-        // `e == 0` is a padded row, not slot 0: with a window open, id 0 is reserved and no
-        // sequence can hold it. Treating the padding as slot 0 pinned that slot forever.
-        if (e > 0 && e < s.w) s.ref_epoch[e] = epoch;
-    }
-
     // 1. Protect the blocks this step's tokens write (§4.10.3): never a claim. The span's
     // table entries are identity ids by that same rule, so no indirection is needed. A span
     // block already resident has its slot refreshed - the write-through (G4) that keeps a
@@ -187,7 +164,7 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
         int p = pos[i / nt] + i % nt;
         if (p < 0 || p / 64 >= tab_nb1) continue;
         long long cell = (long long)(i / nt) * tab_nb1 + p / 64;
-        long long b = entry_block(tab[cell], s.w, s.slot_block);
+        long long b = tab[cell];  // a block id: the table is never rewritten
         if (b < 0 || b >= s.n_blocks) continue;
         if (atomicExch(&s.protected_mark[b], 1) != 0) continue;  // the first touch records it
         int at = atomicAdd(s.span_count, 1);
@@ -216,36 +193,27 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
         if (slot > 0 && r[slot] / 64 == p / 64) continue;
         int seq = min(row / nt, n_seqs - 1);
         long long cell = (long long)seq * tab_nb1 + p / 64;
-        int entry = tab[cell];
-        long long b = entry_block(entry, s.w, s.slot_block);
-        if (b < 0) {
-            // An entry in a live selection naming a slot nobody ever claimed: this table is
-            // not the one this state was built over, and reading through it is wrong.
-            if (entry >= 0 && entry < s.w) bad(s, 1, entry, cell);
-            continue;
-        }
+        // The table is never rewritten: an entry is a block id, and the reader maps it
+        // through `residency` itself. So there is nothing to resolve here but the block.
+        long long b = tab[cell];
+        if (b < 0) continue;  // a padded row
         if (b >= s.n_blocks) {
             bad(s, 2, b, cell);
             continue;
         }
         int32_t v = s.residency[b];
         if (v >= s.w) bad(s, 3, b, v);
-        if (shadow) continue;  // state and counts as usual; the reads stay on the authority
         if (s.protected_mark[b]) {
-            if (v < 0) {
-                atomicAdd(&s.ctl[C_PROTECTED], 1ULL);
-                continue;
-            }
-            s.requested[cell] = 1;  // refreshed above: the slot holds the bytes to read
-            s.slot_ref[v] = 1;
-            s.ref_epoch[v] = epoch;
-            atomicAdd(&s.ctl[C_HITS], 1ULL);
+            // A block this step writes: its slot, if it has one, was refreshed above, and the
+            // attention reads it through the remap either way.
+            if (v < 0) atomicAdd(&s.ctl[C_PROTECTED], 1ULL);
             continue;
         }
-        s.requested[cell] = 1;
         if (v >= 0) {
+            // Served from the slot. It needs no protection from the victim sweep: were the
+            // slot taken below, `residency[b]` would clear in the same breath and every later
+            // reader would fall back to the authority.
             s.slot_ref[v] = 1;
-            s.ref_epoch[v] = epoch;
             atomicAdd(&s.ctl[C_HITS], 1ULL);
             continue;
         }
@@ -314,19 +282,10 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
     }
     __syncthreads();
 
-    // 4. Re-point every walked cell to its block's slot, then clear this step's marks. The
-    // write spans were never requested, so their entries still hold the ids marked above.
-    for (long long c = tid; c < (long long)n_seqs * tab_nb1; c += RT) {
-        if (!s.requested[c]) continue;
-        s.requested[c] = 0;  // cleared on every path, so no bit survives a skipped entry
-        if (shadow) continue;
-        long long b = entry_block(tab[c], s.w, s.slot_block);
-        if (b < 0) continue;
-        int32_t v = s.residency[b];
-        if (v >= 0) tab[c] = v;
-    }
-    // The marks go by the ids recorded above: the table entries have been rewritten since,
-    // and reading them back would name the slot's (possibly new) owner instead.
+    // 4. Clear this step's marks. Nothing needs undoing in the table - this kernel never
+    // writes it; the readers map blocks through `residency`, which is already correct.
+    // The marks go by the ids recorded above, not by reading anything back: this kernel
+    // writes no table, and a slot's owner may have changed underneath it.
     for (int i = tid, n = min(*s.span_count, s.copy_max); i < n; i++) {
         int b = s.span_list[i];
         if (b >= 0 && b < s.n_blocks) s.protected_mark[b] = 0;
@@ -354,7 +313,21 @@ __global__ void copy_kernel(Slots s) {
         long long n = min(s.copy_stride, sg.bytes - off);
         const uint4* src = (const uint4*)(sg.base + (long long)w.x * sg.bytes + off);
         uint4* dst = (uint4*)(sg.base + (long long)w.y * sg.bytes + off);
-        for (long long i = threadIdx.x; i * 16 < n; i += blockDim.x) dst[i] = src[i];
+        for (long long i = threadIdx.x; i * 16 < n; i += blockDim.x) {
+            const uint4 v = src[i];
+            dst[i] = v;
+            // The design rests on one thing: a slot's bytes equal the authority's. Check it
+            // where it is made true - a slot that answers with another block's content is a
+            // wrong read, and no hit rate says so.
+            uint4 back = dst[i];
+            if (back.x != v.x || back.y != v.y || back.z != v.z || back.w != v.w) {
+                if (s.ring->bad_kind == 0) {
+                    s.ring->bad[0] = w.x;
+                    s.ring->bad[1] = w.y;
+                    s.ring->bad_kind = 5;
+                }
+            }
+        }
     }
 }
 
@@ -394,7 +367,6 @@ int legion_kv_slots_ensure(int dev, long long w, long long n_blocks, long long h
               cudaMalloc((void**)&s.claimed_mark, n_blocks * 4) == cudaSuccess &&
               cudaMalloc((void**)&s.span_list, copy_max * 4) == cudaSuccess &&
               cudaMalloc((void**)&s.span_count, 4) == cudaSuccess &&
-              cudaMalloc((void**)&s.requested, cell_space) == cudaSuccess &&
               cudaMalloc((void**)&s.ref_epoch, w * 4) == cudaSuccess &&
               cudaMalloc((void**)&s.meta, 8) == cudaSuccess &&
               cudaMalloc((void**)&s.segs, n_segs * sizeof(Seg)) == cudaSuccess &&
@@ -408,7 +380,6 @@ int legion_kv_slots_ensure(int dev, long long w, long long n_blocks, long long h
          cudaMemset(s.protected_mark, 0, n_blocks * 4) == cudaSuccess &&
          cudaMemset(s.claimed_mark, 0, n_blocks * 4) == cudaSuccess &&
          cudaMemset(s.span_count, 0, 4) == cudaSuccess &&
-         cudaMemset(s.requested, 0, cell_space) == cudaSuccess &&
          cudaMemset(s.ref_epoch, 0, w * 4) == cudaSuccess &&
          cudaMemset(s.meta, 0, 8) == cudaSuccess;
     if (ok) {
@@ -416,8 +387,12 @@ int legion_kv_slots_ensure(int dev, long long w, long long n_blocks, long long h
         s.ring->consumed = 0;
         cudaMemcpy(s.segs, segs, n_segs * sizeof(Seg), cudaMemcpyHostToDevice);
         Slots& into = g_slots[dev];
-        if (into.residency) free_state(into);  // a rebuild: the ids moved
+        if (into.residency) {
+            for (int i = 0; i < into.n_segs; i++) g_by_base.erase((uintptr_t)into.segs[i].base);
+            free_state(into);  // a rebuild: the ids moved
+        }
         into = s;
+        for (int i = 0; i < into.n_segs; i++) g_by_base[(uintptr_t)into.segs[i].base] = &into;
     }
     cudaSetDevice(prev);
     return ok ? 0 : 1;
@@ -444,15 +419,23 @@ void legion_kv_slots_release(int id) {
 /// The captured-graph hook: resolve, then the copy, on `stream`. Called from the
 /// `qsa_kv_slots` op with the attention node's own operands.
 void legion_kv_slots_graph(const int* sel, long long sel_nb1, int* tab, long long tab_nb1,
-                           const int* pos, int rows, int n_tok, int seqs, int shadow, int dev,
+                           const int* pos, int rows, int n_tok, int seqs, int dev,
                            void* stream) {
     const auto it = g_slots.find(dev);
     if (it == g_slots.end()) return;
     Slots& s = it->second;
     resolve_kernel<<<1, RT, 0, (cudaStream_t)stream>>>(
-        (int32_t*)sel, sel_nb1, tab, tab_nb1, pos, rows, n_tok, seqs, shadow, s);
+        (int32_t*)sel, sel_nb1, tab, tab_nb1, pos, rows, n_tok, seqs, s);
     dim3 grid(s.copy_chunks, s.copy_max);
     copy_kernel<<<grid, 128, 0, (cudaStream_t)stream>>>(s);
+}
+
+/// The residency map of the pool whose cache tensor is `base` - what a reader maps a block
+/// id through. Null when that pool has no window (and for the drafter's cache), which is the
+/// reader's "off": no branch, no extra load.
+const int* legion_kv_slots_remap_for(unsigned long long base) {
+    const auto it = g_by_base.find((uintptr_t)base);
+    return it == g_by_base.end() ? nullptr : it->second->residency;
 }
 
 /// Copies the counters out (the reporter's readback): N_CTL u64. 3: no state.

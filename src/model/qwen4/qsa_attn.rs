@@ -1598,6 +1598,9 @@ mod cuda {
         pub kv_row: i64,
         pub table: *const i32,
         pub table_width: i32,
+        /// The KV slot cache's residency map for this pool, or null: see `kv_slot` in
+        /// src/cuda/qsa_attn.cu. Null on every run without `--kv-slot-cache`.
+        pub remap: *const i32,
         pub sel: *const i32,
         pub sel_row: i32,
         pub dst: *mut f32,
@@ -2037,6 +2040,9 @@ fn attn_params(o: &Operands) -> Result<cuda::Attn, String> {
         kv_row: o.kv_row as i64,
         table: o.table,
         table_width: o.table_width as i32,
+        // The pool is its cache tensor, not its GPU: the MTP head's cache lives on this
+        // device too and has no window. Null with no window, so the kernels cost nothing.
+        remap: crate::model::qwen4::slot_cache::remap_for(o.k as u64),
         sel: o.sel,
         sel_row: o.sel_row as i32,
         dst: o.dst,

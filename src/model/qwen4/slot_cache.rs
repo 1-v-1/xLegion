@@ -15,22 +15,27 @@
 //! - the CUDA kernels (src/cuda/kv_slots.cu) run the same walk device-side, inside the
 //!   captured graph, on the arrays this struct lays out field-for-field.
 //!
-//! The per-step contract (`resolve_step`), matching §4.10:
-//! 1. drain the released-block queue (radix frees; §4.10.6),
-//! 2. protect the blocks this step's tokens will write (the spans `pos_s .. pos_s + n_tok`
-//!    through the live table): never claims, and a resident one has its slot refreshed,
-//! 3. walk every selected cell: map its table entry to a block (an entry under `w` is a
-//!    slot already pointed by an earlier layer this step, §4.10.5), mark a hit's clock bit,
-//!    claim each miss's block once,
-//! 4. pick victims by second-chance clock: never a slot the live table or this call needs,
-//!    never a slot this call just claimed (§4.10's `resolve`),
-//! 5. rewrite every walked entry to its block's slot,
-//! 6. return the host -> slot copies, in claim order, for the copy kernel.
+//! The per-step contract (`resolve_step`):
+//! 1. drain the released-block queue (radix frees; §4.10.6) - a recycled id must not answer
+//!    with its previous owner's slot,
+//! 2. the blocks this step writes are never claimed (§4.10.3), and a resident one has its slot
+//!    refreshed from the authority first: that write-through is what keeps a copy from going
+//!    stale (§4.10.1),
+//! 3. walk the selections: a block whose slot holds it is a hit; only a host-backed miss
+//!    claims one - a block already in device memory crosses no link, so paging it would spend
+//!    a slot and a full copy on data that was never slow,
+//! 4. pick victims by second-chance clock, never a slot whose copy this step queued or which
+//!    it just handed out,
+//! 5. return the authority -> slot copies, in order, for the copy kernel - which compares what
+//!    it wrote, because "a slot's bytes equal the authority's" is the single property the whole
+//!    design rests on.
 //!
-//! Slot content outlives its residency: an evicted slot keeps its bytes (and `slot_block`)
-//! until the slot is claimed again, so a table entry never points at bytes that differ from
-//! the host's for the block it names — until the host refills the identity table for the
-//! next step, which erases every rewrite (§4.10.5).
+//! The block table is never written. `residency` is the map (block -> slot, -1 for "read the
+//! authority") and the attention consults it, exactly as Strata's readers go through
+//! `page_table`. Rewriting the shared table in place - the first attempt - forced an epoch to
+//! know which slots were in use, a scan of the whole table at every layer, and an indirection
+//! back through `slot_block`, all to keep a tensor other code reads coherent; and it was a
+//! performance problem on its own at a million-token context (§4.10.12).
 
 /// One pool's cache state. The arrays are the device-side arrays, element for element:
 /// `residency` is indexed by block id (the whole pool; host-backed ids only ever appear in
@@ -41,6 +46,9 @@
 pub struct SlotState {
     /// Slot window width: the pool's block ids `0..w`.
     pub w: usize,
+    /// Blocks below this are in device memory already and are never paged: a copy of one
+    /// crosses no link, and it would spend a slot that a host block needed (§4.10.12).
+    pub hbm: usize,
     /// Total pool blocks (the id domain).
     pub n_blocks: usize,
     /// block -> slot, -1: not resident.
@@ -79,6 +87,7 @@ impl SlotState {
     pub fn new(w: usize, n_blocks: usize) -> Self {
         Self {
             w,
+            hbm: 0,
             n_blocks,
             residency: vec![-1; n_blocks],
             slot_block: vec![0; w],
@@ -101,26 +110,16 @@ impl SlotState {
         }
     }
 
-    /// The block a table entry names: an entry at or above `w` is its own block; one below
-    /// `w` is a slot an earlier layer pointed this step, and `slot_block` says whose bytes
-    /// it holds (§4.10.5). `0` ("never claimed") cannot be addressed by a well-formed walk
-    /// — entries only go below `w` through this model's own writes.
-    fn entry_block(&self, entry: i32) -> Option<usize> {
-        if entry >= self.w as i32 {
-            return Some(entry as usize);
-        }
-        self.slot_block.get(entry as usize).filter(|&&b| b != 0).map(|&b| b as usize - 1)
-    }
-
-    /// One step's resolve; the module docs spell the contract. `table` is the live block
-    /// table (filled with identity ids by the host before the step, rewritten here, refilled
-    /// next step), `sel` the attention node's own selection rows, `pos` the per-sequence
-    /// first position, `n_tok` the tokens each sequence runs this step. Returns the
-    /// host -> slot copies, in claim order (the copy kernel's work list; empty after a
-    /// fully warm step).
+    /// One step's resolve; the module docs spell the contract. `table` is read only: its
+    /// entries are block ids, and the cache is `residency` (block -> slot, -1 = read the
+    /// authority), which the attention consults. Rewriting the table in place instead - what
+    /// this did first - meant an epoch to know which slots were in use, a scan of the whole
+    /// table at every layer, and an indirection back through `slot_block`, all only to keep a
+    /// tensor shared with other readers coherent; §4.10.12. Returns the authority -> slot
+    /// copies, in order, for the copy kernel.
     pub fn resolve_step(
         &mut self,
-        table: &mut [i32],
+        table: &[i32],
         tab_nb1: usize,
         sel: &[i32],
         sel_nb1: usize,
@@ -131,58 +130,39 @@ impl SlotState {
         let n_seqs = (rows / n_tok.max(1)).max(1);
         let cap = sel_nb1.saturating_sub(1);
         debug_assert_eq!(sel_nb1, cap + 1);
+        let mut held = vec![false; self.w];
 
-        // 2. The write-protected set: every block of every sequence's write span. Read the
-        // entry through `entry_block`, not as a block id: an earlier layer of this very step
-        // may already have re-pointed it at a slot, and the block it names is still the one
-        // this step writes (§4.10 step 2). A span block claims nothing; a resident one has
-        // its slot refreshed by this step's copy - the write-through that keeps a resident
-        // copy from going stale (G4, Strata's `kv_append_*` mirror) - taken as a whole-block
-        // byte copy rather than a second quantizing write, so it matches `set_rows` bit for
-        // bit.
+        // 1. The blocks this step writes: never claimed (§4.10.3), and a resident one has its
+        // slot refreshed - the write-through that keeps a copy from going stale (G4), taken as
+        // a whole-block byte copy so it matches `set_rows` bit for bit. The refresh leads the
+        // copy list and is never dropped for a claim; where the list cannot hold one, the
+        // mapping dies and that read falls back to the authority.
         let mut protected = vec![false; self.n_blocks];
-        let mut span: Vec<usize> = Vec::new();
+        let mut copies: Vec<(u32, u32)> = Vec::new();
         for s in 0..n_seqs {
             let p0 = *pos.get(s).unwrap_or(&0).max(&0) as usize;
             for p in p0..p0 + n_tok {
                 let Some(&e) = table.get(s * tab_nb1 + p / 64) else { continue };
-                let Some(b) = self.entry_block(e).filter(|&b| b < self.n_blocks) else { continue };
-                if !protected[b] {
-                    protected[b] = true;
-                    span.push(b);
+                if e < 0 || e as usize >= self.n_blocks {
+                    continue;
+                }
+                let b = e as usize;
+                if std::mem::replace(&mut protected[b], true) {
+                    continue;
+                }
+                let r = self.residency[b];
+                if r >= 0 {
+                    held[r as usize] = true;
+                    copies.push((b as u32, r as u32));
                 }
             }
         }
-        // The refreshed blocks lead the copy list: the attention that runs after this step's
-        // write then reads them from the slot, at every layer of the step.
-        let mut referenced = vec![false; self.w];
-        let mut copies: Vec<(u32, u32)> = Vec::new();
-        for &b in &span {
-            let r = self.residency[b];
-            if r >= 0 {
-                copies.push((b as u32, r as u32));
-                referenced[r as usize] = true;
-            }
-        }
-        // And every slot an entry already points at. An earlier layer of this step wrote
-        // those entries, this layer's selection need not pass over the cells again - and a
-        // later layer may: if a victim takes the slot meanwhile, the entry keeps naming the
-        // slot while `slot_block` names its new owner, and the read lands on someone else's
-        // bytes with no way back. Hence §4.10 step 4's "a slot the live table ... needs".
-        for &t in table.iter().take(n_seqs * tab_nb1) {
-            if t >= 0 && (t as usize) < self.w {
-                referenced[t as usize] = true;
-            }
-        }
 
-        // 3. Walk the selections: hits mark their clock bit; each miss's block is claimed
-        // once. The positions ascend (the `qsa_attn` op's sel format), so a block's cells
-        // concentrate on one entry and consecutive cells dedupe trivially.
+        // 2. The walk: the positions ascend, so one block's cells concentrate on a table entry
+        // and consecutive ones dedupe. A resident block is served from its slot; only a
+        // host-backed miss claims one.
         let mut claim: Vec<usize> = Vec::new();
         let mut claiming = vec![false; self.n_blocks];
-        // Table cells to re-point after victims are picked (each block's entry, deduped by
-        // the ascending walk).
-        let mut rewrites: Vec<usize> = Vec::new();
         for row in 0..rows {
             let r = &sel[row * sel_nb1..];
             let cnt = r[0].max(0) as usize;
@@ -193,31 +173,19 @@ impl SlotState {
                 if p < 0 {
                     continue;
                 }
-                let blk = seq * tab_nb1 + (p as usize) / 64;
-                if blk == last_blk {
+                let Some(&e) = table.get(seq * tab_nb1 + (p as usize) / 64) else { continue };
+                if e < 0 || e as usize >= self.n_blocks {
                     continue;
                 }
-                last_blk = blk;
-                let Some(b) = self.entry_block(table[blk]) else { continue };
-                let r = self.residency[b];
-                if protected[b] {
-                    // A span block claims nothing. Resident (and refreshed above): read the
-                    // slot. Not resident: stay an identity read - claiming it now would copy
-                    // bytes this very step is still changing.
-                    if r < 0 {
-                        self.ctl.protected_skips += 1;
-                        continue;
-                    }
-                    rewrites.push(blk);
-                    self.slot_ref[r as usize] = 1;
-                    referenced[r as usize] = true;
-                    self.ctl.hits += 1;
+                let b = e as usize;
+                if b == last_blk || protected[b] || b < self.hbm {
                     continue;
                 }
-                rewrites.push(blk);
-                if r >= 0 {
-                    self.slot_ref[r as usize] = 1;
-                    referenced[r as usize] = true;
+                last_blk = b;
+                let v = self.residency[b];
+                if v >= 0 {
+                    held[v as usize] = true;
+                    self.slot_ref[v as usize] = 1;
                     self.ctl.hits += 1;
                     continue;
                 }
@@ -228,11 +196,9 @@ impl SlotState {
             }
         }
 
-        // 4. Victims: second chance, never a slot this step reads - the walk named the ones
-        // its attention will hit, the refresh named the write spans, and the live table
-        // names what the earlier layers of this step re-pointed - and never one this call
-        // already handed out. A window with nothing freeable leaves the miss uncached
-        // (correct, counted, no stall).
+        // 3. Victims: second chance, never a slot this step reads (its copy is queued, or its
+        // attention is about to ask for it) or already handed out. A window with nothing
+        // freeable leaves the miss uncached: correct, counted, and no stall.
         for &b in &claim {
             let mut taken = None;
             for _ in 0..2 * self.w {
@@ -242,17 +208,16 @@ impl SlotState {
                     self.slot_ref[v] = 0;
                     continue;
                 }
-                if referenced[v] {
+                if held[v] {
                     continue;
                 }
-                let old = self.slot_block[v];
-                if old != 0 {
+                if let Some(old) = self.slot_block[v].checked_sub(1) {
                     self.ctl.evictions += 1;
-                    // The evicted block's mapping dies; the bytes stay until re-claimed.
-                    if let Some(r) = self.residency.get_mut(old as usize - 1) {
-                        if *r == v as i32 {
-                            *r = -1;
-                        }
+                    // The evicted block falls back to the authority; the bytes stay until the
+                    // slot is claimed again, so a concurrent reader never sees a half-written
+                    // block.
+                    if self.residency[old as usize] == v as i32 {
+                        self.residency[old as usize] = -1;
                     }
                 }
                 taken = Some(v);
@@ -263,21 +228,11 @@ impl SlotState {
                     self.residency[b] = v as i32;
                     self.slot_block[v] = b as u32 + 1;
                     self.slot_ref[v] = 1;
-                    referenced[v] = true;
+                    held[v] = true;
                     self.ctl.misses += 1;
                     copies.push((b as u32, v as u32));
                 }
                 None => self.ctl.overflow += 1,
-            }
-        }
-
-        // 5. Point every walked entry at its block's slot (an identity read where the claim
-        // overflowed, the entry left as it stands).
-        for blk in rewrites {
-            let Some(b) = self.entry_block(table[blk]) else { continue };
-            let r = self.residency[b];
-            if r >= 0 {
-                table[blk] = r;
             }
         }
         copies
@@ -328,18 +283,19 @@ mod tests {
                 .resolve_step(&mut self.table, table_nb1, &sel, sel_nb1, 1, 1, &pos)
         }
 
-        /// The mapping the attention would resolve per cell after the step: the block whose
-        /// bytes a read sees, through the rewritten table (a slot entry reads the block
-        /// `slot_block` names — whose bytes equal that block's host bytes by §4.10.3).
+        /// What a read of each position answers: the authority block, unless the remap sends
+        /// it to a slot - in which case the block that slot actually holds. So this asserts
+        /// the one property that matters: a remapped read still names the block asked for.
         fn reads(&self, positions: &[i32]) -> Vec<usize> {
             positions
                 .iter()
                 .map(|&p| {
-                    let e = self.table[p as usize / 64];
-                    if (e as usize) < self.st.w {
-                        self.st.slot_block[e as usize].saturating_sub(1) as usize
+                    let b = self.st.w + p as usize / 64;
+                    let v = self.st.residency[b];
+                    if v < 0 {
+                        b
                     } else {
-                        e as usize
+                        self.st.slot_block[v as usize].saturating_sub(1) as usize
                     }
                 })
                 .collect()
@@ -368,6 +324,20 @@ mod tests {
         assert_eq!(&s.st.residency[..], &res1[..], "hits never move a mapping");
     }
 
+    /// A block already in device memory crosses no link: paging it would spend a window slot
+    /// and a whole-block copy on bytes that were never slow, and evict a host block that did
+    /// need one.
+    #[test]
+    fn device_resident_blocks_are_never_paged() {
+        let mut s = Sim::new(W);
+        s.st.hbm = W as i32 as usize + 3; // only the block past that is host-backed
+        // Positions 0 and 192 name table cells 0 and 3: block w and block w+3, the last of
+        // which is the only one past `hbm`.
+        let copies = s.step(&[0, 192]);
+        assert_eq!(copies, vec![(W as u32 + 3, 0)], "only the host-backed block is paged");
+        assert_eq!(s.st.residency[W], -1, "the device-backed block keeps its own rows");
+    }
+
     #[test]
     fn a_block_this_step_writes_is_never_claimed() {
         let mut s = Sim::new(W);
@@ -381,8 +351,8 @@ mod tests {
         assert!(copies.iter().all(|&(b, _)| b != 2), "block 2 was written, never copied");
         assert!(copies.iter().any(|&(b, _)| b == 4));
         assert_eq!(s.st.residency[2], -1);
-        assert_eq!(s.table[0], 2, "its entry stays identity");
-        assert!(s.st.ctl.protected_skips > 0);
+        assert_eq!(s.st.residency[2], -1, "a block being written is never cached");
+        assert_eq!(s.reads(&[0, 1]), vec![2, 2], "and is read from its own rows");
     }
 
     #[test]
@@ -470,54 +440,6 @@ mod tests {
         r[0] = cells.len() as i32;
         r[1..].copy_from_slice(cells);
         r
-    }
-
-    /// A slot an entry already points at survives a later layer that never walks over that
-    /// cell. Without it the entry keeps naming the slot while `slot_block` names the slot's
-    /// new owner, and the next layer that selects the block reads somebody else's bytes with
-    /// no way back.
-    #[test]
-    fn a_slot_an_entry_points_at_is_never_a_victim_in_a_later_layer() {
-        let mut st = SlotState::new(1, NB);
-        let tab_nb1 = 4;
-        let mut table: Vec<i32> = vec![1, 2, 3, 4]; // identity: ids at or above w
-        // Layer 1 walks cell 0: block 1 into the only slot, the entry re-pointed.
-        let s1 = row(&[0]);
-        st.resolve_step(&mut table, tab_nb1, &s1, s1.len(), 1, 1, &[1024]);
-        assert_eq!(table[0], 0, "the entry names the only slot now");
-        // Layer 2 walks another cell and misses on block 2. The only slot there is the one
-        // cell 0 points at, so the miss has to overflow rather than take it.
-        let s2 = row(&[64]);
-        let copies = st.resolve_step(&mut table, tab_nb1, &s2, s2.len(), 1, 1, &[1024]);
-        assert!(copies.is_empty(), "nothing freeable: the miss stays uncached");
-        assert_eq!(st.residency[1], 0, "block 1 keeps its slot");
-        assert_eq!(table[0], 0, "the earlier layer's rewrite survives");
-        // Layer 3 back over cell 0 still reads block 1's bytes.
-        st.resolve_step(&mut table, tab_nb1, &s1, s1.len(), 1, 1, &[1024]);
-        assert_eq!(st.slot_block[0] - 1, 1, "the slot still holds block 1");
-    }
-
-    /// The write span is read through `entry_block`. When an earlier layer of the same step
-    /// has already re-pointed the span's entry at a slot, the block behind that entry is
-    /// still the one this step writes: it must stay protected and refreshed. Taking the
-    /// entry as a block id would protect the slot number instead - no refresh, no
-    /// protection, and a later layer reading the bytes from before its own write.
-    #[test]
-    fn a_write_span_entry_an_earlier_layer_re_pointed_is_still_refreshed() {
-        let mut st = SlotState::new(W, NB);
-        let tab_nb1 = 4;
-        let mut table: Vec<i32> = vec![2, 3, 4, 5];
-        let s = row(&[0]);
-        // A step that writes elsewhere claims block 2 (cell 0) and re-points the entry.
-        let copies = st.resolve_step(&mut table, tab_nb1, &s, s.len(), 1, 1, &[1024]);
-        assert_eq!(copies.len(), 1);
-        let slot = table[0];
-        assert!((slot as usize) < W, "the entry names a slot");
-        // The step that writes cell 0: the slot is refreshed, the block stays where it is.
-        let copies = st.resolve_step(&mut table, tab_nb1, &s, s.len(), 1, 1, &[0]);
-        assert_eq!(copies, vec![(2, slot as u32)], "the span block's slot is refreshed");
-        assert_eq!(st.residency[2], slot, "still resident, not claimed elsewhere");
-        assert_eq!(table[0], slot, "and read from that slot");
     }
 
     /// Random steps against a host whose blocks carry their own bytes: every read through a
@@ -620,8 +542,9 @@ pub(crate) fn report_bad(bad: (u64, u64, u64)) {
     );
 }
 
-/// `LEGION_KV_SLOT_SHADOW=1`: claim, copy and count as usual but serve every read from the
-/// authority. One run then says whether wrong output comes from reading a slot at all.
+/// `LEGION_KV_SLOT_SHADOW=1`: the window is kept, filled and counted, but the attention is
+/// handed no map, so every read answers from the authority. One run then says whether a wrong
+/// output comes from reading a slot at all.
 pub(crate) fn shadow() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -631,6 +554,19 @@ pub(crate) fn shadow() -> bool {
         }
         on
     })
+}
+
+/// The residency map of the pool whose cache tensor is `base`: what the sparse attention
+/// maps a selected block through. Null when there is nothing to map - no window, a pool the
+/// window does not cover (the drafter's cache), or shadow mode - and null costs the reader
+/// nothing at all.
+#[cfg(feature = "cuda")]
+pub(crate) fn remap_for(base: u64) -> *const i32 {
+    if !ACTIVE.load(std::sync::atomic::Ordering::Relaxed) || shadow() {
+        return std::ptr::null();
+    }
+    // SAFETY: plain C; a null result for an unknown tensor is the answer, not an error.
+    unsafe { legion_kv_slots_remap_for(base) }
 }
 
 /// The window of the registered state, 0: off (the stats snapshot's question).
@@ -877,7 +813,6 @@ unsafe fn cuda_slots(
             rows as i32,
             (rows / n_seqs).max(1) as i32,
             n_seqs as i32,
-            shadow() as i32,
             p[0] - 1,
             stream,
         );
@@ -911,10 +846,11 @@ unsafe extern "C" {
         rows: i32,
         n_tok: i32,
         seqs: i32,
-        shadow: i32,
         dev: i32,
         stream: *mut std::os::raw::c_void,
     );
+    /// The residency map of the pool a cache tensor belongs to, null for one with no window.
+    fn legion_kv_slots_remap_for(base: u64) -> *const i32;
     /// A freed block's slot dies.
     fn legion_kv_slots_release(id: i32);
     /// The kernel-mirrored counters (11 u64): hits, misses, protected, evictions, overflow,

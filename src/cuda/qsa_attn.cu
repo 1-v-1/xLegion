@@ -75,6 +75,10 @@ struct legion_qsa_attn {
     int64_t kv_row;  // elements per cell: d * n_head_kv
     const int32_t * table;
     int32_t table_width;
+    /// The KV slot cache's residency map for this pool (block -> slot, -1: the authority),
+    /// or null when no window covers it - which is every run without `--kv-slot-cache`, and
+    /// the drafter's cache. Null costs nothing: no branch taken, no load issued.
+    const int32_t * remap;
     const int32_t * sel;
     int32_t sel_row;
     float * dst;
@@ -323,6 +327,14 @@ __global__ void select_kernel(legion_qsa_select p) {
 }
 
 // The prompt kernels' shared shape (sm70/qsa_attn.cuh, sm80/qsa_attn.cuh).
+/// A selected block through the slot cache's residency map: the slot's rows when it holds a
+/// copy (equal bytes, made equal by the copy kernel, which checks itself), the block's own
+/// rows otherwise. Blocks repeat across a row's cells, so the second and later loads hit L1.
+__device__ __forceinline__ int kv_slot(const int32_t* __restrict__ remap, int block) {
+    const int slot = __ldg(remap + block);
+    return slot >= 0 ? slot : block;
+}
+
 constexpr int CH = 16;        // cells per chunk (32 as Strata-AC922 measured slower here: its
                               // shared memory leaves one CTA per SM)
 constexpr int THREADS = 128;  // 4 warps
@@ -604,7 +616,7 @@ __global__ void __launch_bounds__(DTHREADS) decode_kernel(legion_qsa_attn p) {
             int cell = 0;
             if (threadIdx.x < nc) {
                 const int pos = row[1 + base + threadIdx.x];
-                cell = tab[pos / BLK] * BLK + pos % BLK;
+                cell = (p.remap ? kv_slot(p.remap, tab[pos / BLK]) : tab[pos / BLK]) * BLK + pos % BLK;
             }
             cells[threadIdx.x] = cell;
         }
@@ -897,7 +909,7 @@ __global__ void __launch_bounds__(HD, 2) decode_fast_kernel(legion_qsa_attn p) {
         const int nch = (nr + DCH - 1) / DCH;
         if (t < nr) {
             const int pos = row[1 + base + t];
-            const int cell = tab[pos / BLK] * BLK + pos % BLK;
+            const int cell = (p.remap ? kv_slot(p.remap, tab[pos / BLK]) : tab[pos / BLK]) * BLK + pos % BLK;
             cells[t] = cell;
             if constexpr (QUANT) {
                 const int bytes = qblock_bytes(p.v_type);
