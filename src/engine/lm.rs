@@ -7244,8 +7244,10 @@ impl Worker {
             // The KV slot cache's counters: the kernel's mirrored copy, plain memory -
             // no CUDA call on this thread, so this one needs no pace of its own.
             let slot_stats = crate::model::qwen4::slot_cache::active().then(|| {
-                let (h, m, e) = crate::model::qwen4::slot_cache::read_counters();
-                (crate::model::qwen4::slot_cache::window() as u32, h, m, e)
+                (
+                    crate::model::qwen4::slot_cache::window() as u32,
+                    crate::model::qwen4::slot_cache::read_counters(),
+                )
             });
             if expert_stats.is_some() || ngram_stats.is_some() {
                 experts_at = Instant::now();
@@ -7259,11 +7261,14 @@ impl Worker {
                 s.waiting_classes = waiting.classes();
                 s.waiting_keys = waiting.waiting_keys();
                 s.kv_blocks_used = s.kv_blocks_total - self.pool.free_blocks();
-                if let Some((w, h, m, ev)) = slot_stats {
+                if let Some((w, c)) = slot_stats {
                     s.kv_slot_window = w;
-                    s.kv_slot_hits = h;
-                    s.kv_slot_misses = m;
-                    s.kv_slot_evictions = ev;
+                    s.kv_slot_hits = c.hits;
+                    s.kv_slot_misses = c.misses;
+                    s.kv_slot_evictions = c.evictions;
+                    s.kv_slot_protected = c.protected;
+                    s.kv_slot_overflow = c.overflow;
+                    s.kv_slot_drops = c.drops;
                 }
                 if let Some(experts) = expert_stats {
                     s.expert_cache_hits = experts.hits;

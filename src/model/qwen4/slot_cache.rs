@@ -584,6 +584,20 @@ pub struct Seg {
     pub(crate) bytes: usize,
 }
 
+/// What the window reports: the counters the resolve kernel keeps, summed over the
+/// registered devices. `protected` is the read-side half of the write-through story -
+/// selections of a block this step writes that had no slot to read - and `drops` is the
+/// releases a full ring could not queue, each of which forces the whole window down.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SlotCounters {
+    pub hits: u64,
+    pub misses: u64,
+    pub protected: u64,
+    pub evictions: u64,
+    pub overflow: u64,
+    pub drops: u64,
+}
+
 /// The window of the registered state, 0: off (the stats snapshot's question).
 pub(crate) fn window() -> usize {
     WINDOW.load(std::sync::atomic::Ordering::Relaxed)
@@ -595,21 +609,28 @@ static WINDOW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::
 /// Reads the resolve kernel's mirrored copy: plain memory, safe on any thread and never
 /// a CUDA synchronization; values lag a replay by design (a display gauge).
 #[cfg(feature = "cuda")]
-pub(crate) fn read_counters() -> (u64, u64, u64) {
+pub(crate) fn read_counters() -> SlotCounters {
     if !ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
-        return (0, 0, 0);
+        return SlotCounters::default();
     }
     let mut out = [0u64; 6];
-    let mut sum = [0u64; 3];
+    let mut sum = [0u64; 6];
     for &dev in registered().lock().unwrap().iter() {
         // SAFETY: plain C, `out` is 6 u64s.
         if unsafe { legion_kv_slots_read(dev as i32, out.as_mut_ptr()) } == 0 {
-            sum[0] += out[0];
-            sum[1] += out[1];
-            sum[2] += out[3];
+            for (a, b) in sum.iter_mut().zip(out) {
+                *a += b;
+            }
         }
     }
-    (sum[0], sum[1], sum[2])
+    SlotCounters {
+        hits: sum[0],
+        misses: sum[1],
+        protected: sum[2],
+        evictions: sum[3],
+        overflow: sum[4],
+        drops: sum[5],
+    }
 }
 
 /// The devices with a built slot state (kept host-side so the graph builder can gate).
@@ -670,8 +691,8 @@ pub(crate) fn active() -> bool {
 }
 
 #[cfg(not(feature = "cuda"))]
-pub(crate) fn read_counters() -> (u64, u64, u64) {
-    (0, 0, 0)
+pub(crate) fn read_counters() -> SlotCounters {
+    SlotCounters::default()
 }
 
 /// The engine's release hook: a block the allocator freed loses its slot (§4.10.6). With

@@ -1411,6 +1411,20 @@ pub fn draw_kv(f: &mut Frame, area: Rect, app: &App) {
             e.kv_slot_hits,
             asked
         )));
+        // What the miss side is made of, since "slow" reads differently for each: overflow
+        // is a window too small for the step's working set, protected is the newest block
+        // with no slot yet, and any drop means a full release ring flushed the window.
+        lines.push(Line::raw(format!(
+            "slot evict {}  prot {}  ovf {}{}",
+            e.kv_slot_evictions,
+            e.kv_slot_protected,
+            e.kv_slot_overflow,
+            if e.kv_slot_drops > 0 {
+                format!("  drops {}", e.kv_slot_drops)
+            } else {
+                String::new()
+            }
+        )));
     }
     f.render_widget(Paragraph::new(lines).block(block), area);
 }

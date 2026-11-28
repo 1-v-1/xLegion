@@ -329,6 +329,9 @@ pub fn merge_stats(all: &[EngineStats]) -> EngineStats {
         out.kv_slot_hits += s.kv_slot_hits;
         out.kv_slot_misses += s.kv_slot_misses;
         out.kv_slot_evictions += s.kv_slot_evictions;
+        out.kv_slot_protected += s.kv_slot_protected;
+        out.kv_slot_overflow += s.kv_slot_overflow;
+        out.kv_slot_drops += s.kv_slot_drops;
         out.kv_slot_window = out.kv_slot_window.max(s.kv_slot_window);
         out.expert_cache_hits += s.expert_cache_hits;
         out.expert_cache_misses += s.expert_cache_misses;

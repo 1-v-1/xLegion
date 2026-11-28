@@ -75,6 +75,10 @@ pub struct Metrics {
     kv_slot_hits: Gauge,
     kv_slot_misses: Gauge,
     kv_slot_window: Gauge,
+    kv_slot_evictions: Gauge,
+    kv_slot_protected: Gauge,
+    kv_slot_overflow: Gauge,
+    kv_slot_drops: Gauge,
     kv_blocks_total: Gauge,
     prefix_cache_hit_tokens: Gauge,
     kv_preemptions: Gauge,
@@ -192,6 +196,26 @@ impl Metrics {
             &mut registry,
             "legion_engine_kv_slot_window_blocks",
             "KV slot cache window in blocks, 0: off",
+        );
+        let kv_slot_evictions = gauge(
+            &mut registry,
+            "legion_engine_kv_slot_evictions",
+            "Slots taken from another block by the second-chance clock (cumulative)",
+        );
+        let kv_slot_protected = gauge(
+            &mut registry,
+            "legion_engine_kv_slot_protected",
+            "Selections of a block this step writes that had no slot to read (cumulative)",
+        );
+        let kv_slot_overflow = gauge(
+            &mut registry,
+            "legion_engine_kv_slot_overflow",
+            "Misses no victim could serve, read over the link instead (cumulative)",
+        );
+        let kv_slot_drops = gauge(
+            &mut registry,
+            "legion_engine_kv_slot_drops",
+            "Releases a full ring could not queue; each one flushed the whole window",
         );
         let kv_blocks_total = gauge(
             &mut registry,
@@ -347,6 +371,10 @@ impl Metrics {
             kv_slot_hits,
             kv_slot_misses,
             kv_slot_window,
+            kv_slot_evictions,
+            kv_slot_protected,
+            kv_slot_overflow,
+            kv_slot_drops,
             prefix_cache_hit_tokens,
             kv_preemptions,
             spec_draft_tokens,
@@ -426,6 +454,10 @@ impl Metrics {
         self.kv_slot_hits.set(stats.kv_slot_hits as i64);
         self.kv_slot_misses.set(stats.kv_slot_misses as i64);
         self.kv_slot_window.set(stats.kv_slot_window.into());
+        self.kv_slot_evictions.set(stats.kv_slot_evictions as i64);
+        self.kv_slot_protected.set(stats.kv_slot_protected as i64);
+        self.kv_slot_overflow.set(stats.kv_slot_overflow as i64);
+        self.kv_slot_drops.set(stats.kv_slot_drops as i64);
         self.kv_blocks_total.set(stats.kv_blocks_total.into());
         self.prefix_cache_hit_tokens
             .set(stats.prefix_cache_hit_tokens as i64);

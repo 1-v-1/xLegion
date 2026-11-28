@@ -313,6 +313,12 @@ pub struct EngineStats {
     pub kv_slot_hits: u64,
     pub kv_slot_misses: u64,
     pub kv_slot_evictions: u64,
+    /// Selections of a block this step writes with no slot to read (the write-through has
+    /// not covered it yet), slots no victim could free (the read stayed on the link), and
+    /// releases a full ring dropped - each drop flushed the whole window once.
+    pub kv_slot_protected: u64,
+    pub kv_slot_overflow: u64,
+    pub kv_slot_drops: u64,
     /// Routed expert selections served by resident slots or the host tier.
     pub expert_cache_hits: u64,
     pub expert_cache_misses: u64,
