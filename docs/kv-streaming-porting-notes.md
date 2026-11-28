@@ -198,6 +198,16 @@ block table、KV 写的 `cells`、`pos` 都是**每步由 host 重新填充的�
     - 口径差异记账（不当 bug 追）：kernel 的 evictions 只在映射真死时加、overflow 多两处（列表满）；claim 顺序由 `atomicAdd` 决定 → victim 分配 run-to-run 不同（输出仍逐位一致，命中率会漂）。
     - 仍留给 hardening：`g_slots` 无锁（release 在 allocator 线程、read 在 reporter 线程、ensure 在 worker 线程）；`ensure` 失败路径漏设备内存；rebuild 与已捕获图的指针烘焙（现依赖 `resize_kv` 先 `forget_graphs`，需覆盖到 MTP/verify 的图）；`ensure` 不 assert `w ≤ n_blocks`、`Seg.bytes % 16`；copy 列表容量未按工作集定标（§4.10.9）。
 
+11. **上线后实测到的根因：状态按设备注册，而一台卡上有两个池（2026-11-28，真机报"丢上下文"）。**
+    `node()` 的开关是"这台 device 注册过状态没有"，而 `--spec mtp` 的草稿头在**最后一个 stage 的同一张卡**上有自己的 `mtp_kv` 池（`new_tiered(&[n_layer])`；qwen4exp 不实现 `mtp_shares_kv()`，所以这个池确实存在）。草稿那一步同样走 `sparse_paged`，于是 resolve 拿目标池的 `residency`/`slot_block`/`segs` 去改写**草稿池的 block table**：
+
+    - 症状一（致命）：草稿头按错的行读 KV → 草稿错 → 验证接受错 → 序列内容偏掉。目标自己的注意力仍然自洽，所以输出看着流利、只是丢上下文；`--kv-slot-cache 0` 完全正常。
+    - 症状二（骗人的好消息）：`residency[]` 按草稿池自己的 id 索引，那些下标在目标池里"多半有值"，于是 **命中率报 100%**（5.66 亿次读、15.5 万 miss）。计数是被 spec 的步数放大过的，不能当"缓存有效"看。
+
+    修法：注册表按**缓存张量基址**索引（`register` 本来就拿得到每层 K/V 的基址），`node()` 用 `k` 的基址查，查不到就不建节点；MTP 池显式登记为"故意不开窗"，这样陌生池子走进这个钩子会警告一次——因为"少建一个节点"本身是无声的。
+    **教训**：`device` 不是池的身份。任何"按 GPU 键控"的设备端状态，遇到"同卡第二个池"（MTP 头、`kv_spill`、将来的第二个模型）都会串味；新池接进这条钩子时要么显式豁免、要么让它出声。
+    **另**：命中率/命中数只能证伪"完全没生效"，不能证明字节对。**这类功能的唯一判据是同一文本开/关逐字节对比**（§4.10.8），我上一轮把它当成"待办"，实际上它应该在第一次真机跑之前就存在。
+
 ## 5. 分期与决策点
 
 - **Phase 0 — 测量，先于一切实现**：插桩已实现（`LEGION_DEBUG_KV_STATS=1`，

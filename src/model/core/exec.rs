@@ -1308,6 +1308,26 @@ impl Executor {
                     cell_space,
                     &segs,
                 );
+                // The drafter's cache runs on the last stage's GPU (`new_tiered(&[n_layer])`
+                // above) and reaches the same hook. Record it as deliberately unwindowed:
+                // its block table is not this state's to rewrite, and its ids are its own -
+                // reading them through the target's `residency[]` answered "resident" for
+                // nearly everything and served the drafts the wrong rows. Any *other* pool
+                // hitting the hook uninvited still says so once.
+                if si + 1 == self.stages.len() {
+                    if let Some(mtp) = self.mtp_kv.as_ref() {
+                        let (pk, pv) = mtp.pools(self.model.hp.n_layer);
+                        let skip: Vec<crate::model::qwen4::slot_cache::Seg> = [pk, pv]
+                            .iter()
+                            .map(|p| crate::model::qwen4::slot_cache::Seg {
+                                // SAFETY: the pool tensor's rows; the base is stable for its life.
+                                base: unsafe { (*p.raw()).data as u64 },
+                                bytes: p.nb()[1] as usize * super::state::KV_BLOCK,
+                            })
+                            .collect();
+                        crate::model::qwen4::slot_cache::exclude(&skip);
+                    }
+                }
             }
         }
         Ok(())

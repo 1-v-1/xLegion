@@ -615,7 +615,10 @@ pub(crate) fn read_counters() -> SlotCounters {
     }
     let mut out = [0u64; 6];
     let mut sum = [0u64; 6];
-    for &dev in registered().lock().unwrap().iter() {
+    let mut devs: Vec<usize> = pools().lock().unwrap().iter().map(|&(_, d)| d).collect();
+    devs.sort_unstable();
+    devs.dedup();
+    for &dev in devs.iter() {
         // SAFETY: plain C, `out` is 6 u64s.
         if unsafe { legion_kv_slots_read(dev as i32, out.as_mut_ptr()) } == 0 {
             for (a, b) in sum.iter_mut().zip(out) {
@@ -633,11 +636,51 @@ pub(crate) fn read_counters() -> SlotCounters {
     }
 }
 
-/// The devices with a built slot state (kept host-side so the graph builder can gate).
+/// The cache tensors of every pool with a state, with the device that holds it. Keyed by
+/// tensor, not by device: `--spec mtp` runs a drafter with its own pool on the same GPU,
+/// and any second pool would do the same - gating on the device let the resolve rewrite
+/// a pool it knows nothing about, reading its block table through these arrays.
 #[cfg(feature = "cuda")]
-fn registered() -> &'static std::sync::Mutex<Vec<usize>> {
-    static R: std::sync::OnceLock<std::sync::Mutex<Vec<usize>>> = std::sync::OnceLock::new();
+fn pools() -> &'static std::sync::Mutex<Vec<(u64, usize)>> {
+    static R: std::sync::OnceLock<std::sync::Mutex<Vec<(u64, usize)>>> = std::sync::OnceLock::new();
     R.get_or_init(Default::default)
+}
+
+/// A pool that deliberately has no state, recorded so an unmatched pool is either silent
+/// (expected: the drafter) or loud (a real pool that silently got no cache - which, being
+/// a missing node, would otherwise look like nothing at all).
+#[cfg(feature = "cuda")]
+const NO_STATE: usize = usize::MAX;
+
+/// Whether the cache state on `dev` was built over `base` (one of that pool's cache
+/// tensors). Graph-build time only: the answer is baked into the node's parameters.
+#[cfg(feature = "cuda")]
+pub(crate) fn serves(base: u64, dev: usize) -> bool {
+    pools().lock().unwrap().iter().any(|&(b, d)| b == base && d == dev)
+}
+
+/// Record a pool's cache tensors as deliberately unwindowed.
+#[cfg(feature = "cuda")]
+pub(crate) fn exclude(segments: &[Seg]) {
+    pools()
+        .lock()
+        .unwrap()
+        .extend(segments.iter().map(|g| (g.base, NO_STATE)));
+}
+
+/// Warn once per cache tensor that reaches the hook with no state and no exemption.
+#[cfg(feature = "cuda")]
+fn unknown(base: u64) {
+    use std::collections::HashSet;
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<HashSet<u64>>> = std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(Default::default);
+    let mut g = seen.lock().unwrap();
+    if g.insert(base) {
+        tracing::warn!(
+            cache = format!("{base:#x}"),
+            "kv slots: a sparse attention reads a cache the window knows nothing about (no node built for it)"
+        );
+    }
 }
 
 /// Build device `device`'s slot state for a pool of `n_blocks` blocks whose first `w` are
@@ -661,10 +704,11 @@ pub(crate) fn register(device: usize, w: usize, n_blocks: usize, cell_space: usi
         tracing::warn!(device, "kv slots: cannot build the cache state (error {code})");
         return;
     }
-    let mut r = registered().lock().unwrap();
-    if !r.contains(&device) {
-        r.push(device);
-    }
+    // (Re)index this pool's tensors. The stale bases go first: a resize moves the pool, and
+    // a recycled address must not resolve to a state whose segments it is not part of.
+    let mut r = pools().lock().unwrap();
+    r.retain(|&(_, d)| d != device);
+    r.extend(segments.iter().map(|g| (g.base, device)));
     drop(r);
     // From here on a freed block id loses its slot before it can be handed out again
     // (§4.10.6). Idempotent; every pool's free path then reaches the release queue.
@@ -719,7 +763,14 @@ pub(crate) fn node<'a>(
     pos: crate::ggml::Tensor<'a>,
 ) -> Option<crate::ggml::Tensor<'a>> {
     let dev = k.cuda_device()?;
-    if !registered().lock().unwrap().contains(&dev) {
+    // Which pool, not which device: the drafter's cache lives on this GPU too, and its
+    // block table is not this state's to rewrite.
+    let base = unsafe { (*k.raw()).data as u64 };
+    if !serves(base, dev) {
+        let known = pools().lock().unwrap().iter().any(|&(b, _)| b == base);
+        if !known {
+            unknown(base);
+        }
         return None;
     }
     Some(ctx.external_with(
