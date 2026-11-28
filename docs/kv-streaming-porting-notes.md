@@ -13,6 +13,7 @@ Strata 侧以 v0.2.x main（浅克隆 `628f749` 之后，本地 `/tmp/strata-src
 3. 移植所需的积木里，最难的部分（reader 不改、graph 安全、host 权威、写者正确性、MTP 环）在两侧都已各自验证过；缺的是一个 resolve/copy kernel 对、写者双写、以及驻留图状态。位级一致性有 Strata 的 parity 测试模板可移植。
 4. **收益场景狭窄但真实**：只在"KV 出现 host tier 且有 QSA 稀疏注意力"时有意义 —— PCIe 独立 GPU（4090 类，链路 ~25 GB/s）收益最大；AC922 NVLink（68.5 GB/s）中等；GB10/C2C 与集成内存不出现 host tier，不适用。Strata 实测 +6% @128K / +23% @262K（Q2_0、24 GB 级显卡，`terminal/strata_control/setup_config.py:302-305`）包含"腾显存"收益，Legion 移植的边际收益低于该数，Phase 0 应先测量。
 5. 建议按 §6 的三步走：Phase 0 插桩测量（每步选中块命中 host tier 的字节数与重复率）→ Go/No-Go → 最小闭环（resolve + copy + 双写，默认关，q8_0/q4_0 only）→ 策略与自动化。
+6. **当前状态（2026-11-29，读这里就知道现在能不能用）**：Phase 1 的机制在 `feat/kv-slot-cache` 上实现完了，但**没有一次真机运行验证通过**——`--kv-slot-cache` 默认 0（关），开着会在长上下文越过 VRAM 后丢对话，原因尚未定位（§4.10.13、§4.10.14）。**不要动 Phase 2**，也不要把 §5.3 那份收益数字当成这个特性的收益：那是在旧划界下测的，口径与实现不一致（§5.3 末）。唯一判据仍是同一文本开/关逐字节对比；`kind=6` 的自检会让下一次运行自己说明"读到的是不是陈旧字节"。
 
 ## 1. Strata 功能解剖
 
@@ -197,6 +198,7 @@ block table、KV 写的 `cells`、`pos` 都是**每步由 host 重新填充的�
     - `requested` 的位在 `continue` 分支上没清、`protected_mark` 的清除依赖**已被本 call 改写的表**反查（可能清到新主人，旧块 sticky）→ 改为 step 1 记 `span_list`、按 id 清；清理 claim 的计数也不能用 `copy_count`（它已含 refresh 项）。
     - 口径差异记账（不当 bug 追）：kernel 的 evictions 只在映射真死时加、overflow 多两处（列表满）；claim 顺序由 `atomicAdd` 决定 → victim 分配 run-to-run 不同（输出仍逐位一致，命中率会漂）。
     - 仍留给 hardening：`g_slots` 无锁（release 在 allocator 线程、read 在 reporter 线程、ensure 在 worker 线程）；`ensure` 失败路径漏设备内存；rebuild 与已捕获图的指针烘焙（现依赖 `resize_kv` 先 `forget_graphs`，需覆盖到 MTP/verify 的图）；`ensure` 不 assert `w ≤ n_blocks`、`Seg.bytes % 16`；copy 列表容量未按工作集定标（§4.10.9）。
+      （更新 2026-11-29：其中 `g_slots` 加锁、`ensure` 失败路径回收、`w ≤ n_blocks` 与 `Seg.bytes % 16` 校验已做掉，见 §4.10.13；剩下的仍是 rebuild 与已捕获图的指针烘焙、copy 列表按工作集定标。）
 
 11. **上线后实测到的根因：状态按设备注册，而一台卡上有两个池（2026-11-28，真机报"丢上下文"）。**
     `node()` 的开关是"这台 device 注册过状态没有"，而 `--spec mtp` 的草稿头在**最后一个 stage 的同一张卡**上有自己的 `mtp_kv` 池（`new_tiered(&[n_layer])`；qwen4exp 不实现 `mtp_shares_kv()`，所以这个池确实存在）。草稿那一步同样走 `sparse_paged`，于是 resolve 拿目标池的 `residency`/`slot_block`/`segs` 去改写**草稿池的 block table**：
@@ -216,6 +218,36 @@ block table、KV 写的 `cells`、`pos` 都是**每步由 host 重新填充的�
     顺带修掉两处：`kv_stats.cu` 按 `block >= hbm` 判断 host 读，与槽无关地照常统计（之前把槽算成本地读，`hits` 虚高）；解析只搬 host 段的块。拷贝内核**拷完就地比对**，不一致记 `kind=5`——"槽内容等于权威"是整个设计唯一依赖的性质，它该由程序断言，不该靠推理。
 
     **状态**：模型侧 9/9 通过（含 `hbm` 规则、写穿、二次机会）；**`.cu` 与 `#[cfg(feature="cuda")]` 的 Rust 在本机无法编译验证**（没有 nvcc，`build.rs` 先失败），需要真机构建。
+
+13. **重构的第一次真机运行是 SIGSEGV，而"自检"其实没有诊断力（2026-11-29）。**
+    启动即崩在打完 `kv slot cache: window inside the device range` 之后：注册表 `g_by_base` 是用 `into.segs[i].base` 填的，而 `Slots::segs` 是**设备副本**，在 host 上取值就是解引用设备指针。改成用调用方的 host 数组填、按 owner 清理旧项（`f65a044`，单独一个 commit，好让"只修崩溃"这个点能被单独取用）。
+
+    顺带承认两件把我说错过的地方：
+
+    - §4.10.11 那个 MTP 根因是**真的**（同卡两个池共用一份状态，代码层面成立），但它**不是**本轮"超出 VRAM 才丢上下文"的解释——修完症状依旧。教训不是"它错了"，而是：一次真机只证伪一个假设，不能因为它自洽就宣布破案。
+    - §4.10.12 里那句"拷贝内核拷完就地比对"**言过其实**：`dst[i] = v` 之后回读 `dst[i]` 只能证明这次写落地，源地址错了、块选错了，它一样"通过"。它保留下来（kind=5 仍说明写没落地），但它不承担验证映射的职责。
+
+    真正要的那个性质改成在**命中发生的那一刻**检查：resolve 里按哈希抽样（每 1024 次命中一次，块间与步间都散开）登记 `(块, 槽)`，交给同一个 copy kernel 比对权威与副本的**首尾各 16 KB**——写穿漏掉的块差异在尾部，认错主人的槽处处都不同，两端覆盖实际情形而成本只是一次拷贝的零头。不一致就当场 `residency[块] = -1`：这个块的下一次读立刻回到权威，于是一份陈旧副本最多只错一次读，而不是整段对话；同时报 `kind=6` 带上两个 id，让"到底有没有发生过"由运行自己回答（`75e4253`）。
+
+    同一轮从读代码得到的（不是从 bug 推的）：`g_slots`/`g_by_base` 无锁（`ensure` 在每次 `resize_kv` 插入，而 `release` 在 allocator 线程、`read` 在 reporter 线程、`graph` 在 worker 线程 → map 插入与 find 并发是 UB）；`ensure` 不校验段是否 16 字节对齐、不校验 `w ≤ n_blocks`（两者都会让 `uint4` 的拷贝错位读而不是失败）；`ensure` 的失败路径漏掉它已分配的一切。这三项都已做。锁只覆盖容器本身——"重建时没有图在执行"不是这把锁能保证的。
+
+14. **为"超出 VRAM 才丢上下文"读代码排除掉的可能（2026-11-29）**。这些都验证过、不是推测，下次不要重查：
+
+    | 假设 | 结论与依据 |
+    |---|---|
+    | indexer 的 keys 也被重指向 | **排除**。`qsa_pool_keys` 用的是 host 侧填的 `QsaInputs::new_idxs`/`pool_cells`（src/model/qwen4.rs:2150-2180），不读 block table。 |
+    | 稠密 paged prefill 的 staging 槽与 `[0,w)` 窗重叠 | **排除**。staging 目标是独立张量 `Tier::k_stage`/`v_stage`（src/model/core/paged.rs:302-313），不是池里的行。 |
+    | 写 span 不覆盖所有 KV 写 | **排除**。所有 KV 写都走 `pass.write_cells(il)`，它就是 `n_past..n_past+n_tok` 映射出的 cell（src/model/core.rs:1536），与 resolve 算的 span 一致。 |
+    | 拷贝的段地址与池的行寻址不一致 | **排除**。池的契约是"一个块 = `KV_BLOCK` 个连续位置"（src/model/core/state.rs:79-80），`nb()[1] × 64` 正是它；attention 的 `cell × nb[1]` 与之同址。 |
+    | KV 写在辅助 stream 上，与本层 resolve 竞态 | **排除**。外部算子一律在 backend 那条流上（src/ggml/external.rs:16-28），图内按序；本仓库的辅助 stream 只在 host-tier/peer staging、comm_bench、视觉塔。`--long-dataflow` 换的是输入的 pinned 双缓冲，不是第二条计算流。 |
+    | 我为"使用率别把窗算成已用"改的 `kv_blocks_total` | **排除**。只进 `/metrics` 与面板，不参与调度或截断。 |
+    | f16 缓存下这个功能本不该开（写路径另有其条） | **排除**。`qsa_attn::reads_types` 明确允许 `is_f16()`（src/model/qwen4/qsa_attn.rs:981-984），而刷新只依赖"本步写过这个块"，与哪个 kernel 写的无关。目标机是 f16/f16，窗确实在工作。 |
+    | `release` 钩子没接线 | **排除**（我一度按 grep 认定它没接）。`register` 里 `BlockPool::set_free_observer(release)`，`decref` 经 fn 指针调用（src/kv/blocks.rs:267-272）——按 `slot_cache::` 前缀搜不到调用者是因为它走函数指针。 |
+
+    **仍不知道"为什么丢上下文"**。上表的性质都成立，而现象是真的，说明理解仍有缺口。`kind=6` 是把这句话变成一次可判定运行的东西：它要么报出来（拷贝/寻址/陈旧这一类，且当场自动降级），要么不报（那么错不在"读到陈旧字节"，要换方向找）。
+
+    **另一个必须记住的工程事实**：本机 `~/.cargo/bin/cargo` 是 x86-64 ELF，在 arm64 macOS 上**根本无法执行**（`cannot execute binary file`）。此前几轮"cargo check 错误数与基线一致"如果用的是它，那个数字是假的——命令压根没跑。可用的是 `~/.rustup/toolchains/stable-aarch64-apple-darwin/bin`（需把该目录置于 PATH 前，并给 cargo 访问 `~/.cargo/registry` 的权限）。当前该基线是 **25 个错误，全部在 Linux 专有 API 的文件**（residency/numa/load_io/weights/gguf/tp_net/cpu），不含本特性的任何文件。模型侧用 `$rustc --test` 单独编译 src/model/qwen4/slot_cache.rs 的模型段（runtime 分界线之前）跑，9/9。
+
 ## 5. 分期与决策点
 
 - **Phase 0 — 测量，先于一切实现**：插桩已实现（`LEGION_DEBUG_KV_STATS=1`，
@@ -328,6 +360,19 @@ decode tok/s 与同文本贪心一致。
 测量工具本身被这轮暴露并已修复一处口径缺陷：直方图原为 decode/prompt 共用一份，decode
 行报过 `0 fetches, 946 unique` 的自相矛盾行（commit `38ff015` 改为 per-bucket 双份）。
 判定数字不受影响（两 bucket 的 unique 相同 = 同一热集）。
+
+**但这些数字与第一版实现的口径不一致，读它们时必须带着这一条。** 上面所有数字（42.5%
+cells_host、Top-1K 覆盖 93%、1000× 复用）测的是**旧的静态划界**：那时分配器优先发 VRAM
+块，所以近期正在写的块天然在 VRAM、根本不贡献 host 流量，host 流量全部来自溢出的历史块。
+而第一版实现走的是姿态 B（`hbm_blocks = w_eff`）：每一个序列持有的块都变成 host-backed，
+**包括正在写的尾部块**——那部分流量是它新造出来的，而且被 §4.10.3 的写集规则永久排除在
+缓存之外，机制上不可能救回来。同时 `max_w = total - ctx_blocks` 允许 `w > 原 hbm`，此时它
+反而从 expert cache 那里**多占**显存，与上面"expert 吃紧 → 把 VRAM 腾给它"的判定方向相反。
+
+也就是说：**这份测量支持的是姿态 A 的收益上界，却被用来支持了姿态 B 的决策。** 实现现在已
+改为"窗在 `--kv-cache-tokens` 的设备段内部 reserve"（§4.10.12 之后的定稿，两个容量 flag
+含义不变，代价是 KV 容量少 w 块），与这里测量的口径一致；也因此**这些数字只能当作"上界可
+能是多少"，不能当作预期值**——真实净值还要减去每层两个图节点的固定开销（§4.10.5、§4.10.9）。
 
 
 
