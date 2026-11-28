@@ -129,7 +129,9 @@ Strata 的 +6%/+23% 数字包含"KV 出 VRAM → expert slots 变多"的收益�
 1. **空间来源与数据结构（不新增内存）**：slot 不另开分配——它就是 KV 池 VRAM 窗内保留的一段普通块（同一 tiered 虚拟范围、同一指针寻址；residency map 做 block→block 重指向，不给 graph 添新指针），容量口径仍完全由 `--kv-cache-tokens` 决定，slot 不参与 admission。边界内移是唯一的账目移动：
    - **姿态 A（保守）**：`[0..hbm-S)` 原生 + `[hbm-S..hbm)` = S 个 slot，KV VRAM 总字节不变，被挤下的 S 块落入 host tier（真实 RAM 开销 = S×块字节，4090/40K 全池也仅 ~0.5 GB 量级）；expert cache 不受影响，收益 = 纯链路折减。
    - **姿态 B（Strata 原形态）**：流式模式下把 KV VRAM 窗收缩到选择工作集 W（`max_seqs × (515/4+2)` 块 × 裕量），窗即纯 slot 池，KV 少拿的 VRAM 由 `cache_budget("all the rest")` 自动给 expert slots——在 Legion 账本里 **Strata mode 1 ≡ "hbm 窗整体变纯 slot + 边界下移到 W + resolve"**（host tier 即其 pinned 权威副本，`hbm_blocks` 即其 `n_slots`）。拿回"+6%/+23%"里腾显存那一半，代价是触发域扩大到上下文塞得进 VRAM 的机器。
-   - A/B 共用全部机制代码，只差边界取值，Phase 0 数据定 auto 策略。当前无 tier 的部署不触发，零 RAM 意外。
+   - **定稿：A，且账目按"少容量"而非"多占 RAM"（2026-11-28）。** 落地时先走了 B（`hbm_blocks = w`、host 段吞下被让出的块），实测更慢，原因有三条：① 它使 `--kv-host-tokens` 不再等于实际 pin 的量（承诺被打破）；② 序列的所有块都变 host-backed，而正在写的尾块按不变量进不了缓存 → 每步一笔机制上无法消除的链路读；③ `max_w = total − ctx` 允许窗超过原 hbm，反向吃 expert cache 的显存，与 §5.3"expert 已吃紧 → 把 VRAM 腾给它"的判定方向相反。
+     最终形态只保留 `pool.reserve(w)`：**tier 边界与 host 段都不动**，窗是设备段内的前 w 个 id，序列拿 `[w, N)`——其中 `[w, hbm)` 仍是 VRAM 权威块（近期块留在 VRAM，因此不需要双写也能本地读），`[hbm, N)` 是 host 块。两个容量 flag 的含义与实际用量都不变，窗的代价就是 KV 容量：序列共用 `N − w`。§4 姿态 A 原文"被挤下的 S 块落入 host tier（真实 RAM 开销 = S×块字节）"是 A1 口径，按此定稿作废——没有"落入 host"，是容量少 S。
+     窗可开到吃满设备段（`w = hbm`）：此时序列没有 VRAM 落脚块，每个 token 的 KV 写都要过链路，prefill 首当其冲（Strata 在 HIP 上实测 kernel 直写 host 仅 ~0.24 GB/s、每 prompt token 50 µs，见 §1.6），所以 `w = hbm` 合法但会警告，留多少落脚地交给用户。
    驻留图设备端数组复用 Strata 字段集（`slot_block/slot_stamp/slot_ref/miss_block/miss_slot/ctl`，`kv_stream.hpp:70-88`）。
 2. **图内顺序**：`qsa_select` 产出 `sel` 之后、`qsa_attn::attention` 之前插 resolve + copy（对应 `verify.cpp:2417-2432` 的接线）。Legion 的 block table 每步由 host 刷新上传（`src/model/core/exec.rs` step 路径，表作为图输入数据），**上一步的重指向不持久**——这反而是对的：resolve 每步做一次"表内 host 块 → 已驻留 slot"的映射改写（查驻留图，命中即改表项，纯设备端），未驻留的走认领/置换/拷贝。驻留图本身持久于步间。
 3. **写者**：KV 写（`set_rows` 散列到 cell）当前按表项地址写一处。改为：目标块属 host 区且驻留 → 双写（host identity 位置 + slot）；属 host 区未驻留 → 只写 host。论证照抄 Strata：draft 拒绝/回退写的 cell 在被读到之前不需要任何读者看见（`kv_stream.hpp:18-20`、`layer.cpp:1012-1014`）。
@@ -138,11 +140,10 @@ Strata 的 +6%/+23% 数字包含"KV 出 VRAM → expert slots 变多"的收益�
 6. **与现有借还机制的边界**：slot 区间计入 KV 的 VRAM 窗（`kv_fit`/`CacheShare` 语义不变）；`--kv-vmm-keep` 借出 VRAM 与 slot 池的交互 v1 用"slot 区间不借出"回避，后续再统一。
 7. **flag 与策略（终态形状）**：不新增正向开关，不改现有 flag 语义——
    - `--kv-cache-tokens` / `--kv-host-tokens` 保持容量/划界语义不变（它们对稠密模型必须继续是纯容量；把放置行为塞进容量 knob 会让既有命令行在升级后漂移，且 Strata 式"host 全量权威"的 retrofit 会白吃全池 RAM 与每 token 一次 host 镜像写）。
-   - 机制随条件**自动生效**：host tier 存在 ∧ QSA 架构 ∧ q8_0/q4_0。先例即 expert 侧热缓存——tier 就是机制，没有 enable flag（`--experts cache` 只控容量）。**已按此落地**（auto-on ∧ `--no-kv-slot-cache` 关；`LEGION_DEBUG_KV_SLOTS` 只覆盖宽度），真机 A/B（§5.4）是验收门。
-   - 唯一新增 surface：`--no-kv-slot-cache` 否定开关（A/B、排障、`--deterministic` 场景），`switches.rs` 一行，`--no-expert-peer-fetch` 式（`docs/serving.md:178` 的模式）。**已加**，`serving.md` 表格行同步。
-   - 尺寸：开发期即 debug env 的 `<W>`；auto 值 = 选择工作集下界 `max_seqs × (515/4 + 2)` 块与 KV VRAM 窗的一小部分（下界纯代码可算；实测热集 ~1.3K 块 → 默认 W 从 2048 起议）；正式 flag 留到 auto-on。
-   - `--kv-vmm-keep` / `--kv-slots` / `--tp` 与窗互斥（v1 范围限制，启动时窗自动不开并说明）。
-   - 配套（随 auto-on）：memory plan 行（`src/engine/lm/plan.rs`）、`/metrics` hit/miss/overflow、`docs/serving.md` 表格一行。开发期已有启动日志行与 debug-env 条目。
+   - **定稿（2026-11-28）：显式开关 + 默认关。** `--kv-slot-cache <tokens>`，0 = 关。不再 auto-on——收益尚未在目标机证实（首版实测更慢），默认打开等于让用户升级后莫名变慢；§4.7 原先引的"expert 侧热缓存没有 enable flag"不成立，那侧的收益是实测过的（§5.3 hit_rate 0.645→0.887）。
+   - 尺寸就是 `--kv-slot-cache` 本身，不设第二个旋钮：`LEGION_DEBUG_KV_SLOTS` 与 `DEFAULT_WINDOW_BLOCKS` 已删（一个宽度藏在 debug env、一个藏在常数，是首版最难排查的地方）。要试别的窗宽就改这个 flag——它本来就是用户会读的数，测出来的结论对他才有意义。
+   - `--kv-vmm-keep` / `--kv-slots` / `--tp` 与窗互斥（v1 范围限制，启动时窗自动不开并说明）；无 host tier、非 QSA 架构、缓存类型不是 q8_0/q4_0 时同样不开并各自说明原因。
+   - 配套：memory plan 行（`src/engine/lm/plan.rs`，同时报 `kv_usable_tokens` 让容量的减少可见）、`/metrics` hit/miss/evictions、`docs/serving.md` 表格一行。
 
 ### 4.10 Phase 1 实现设计定稿（2026-11-27，读通池/写路径后）
 
@@ -151,8 +152,8 @@ VMM 虚拟范围（块 id < hbm 在 VRAM、≥ hbm 在 host arena，**同一指�
 block table、KV 写的 `cells`、`pos` 都是**每步由 host 重新填充的图输入**；KV 写走
 `cells`（host 侧按原始 block id 算出），**不经 attention 的表**。由此：
 
-1. **G4（写者双写）取消。** 写恒写 host identity 位；一致性不靠镜像，靠"槽里放着的块
-   不会再被写"（下述 3）。写路径一行不改。
+1. **G4（写者双写）以"块刷新"的形式保留（2026-11-28 定稿，推翻此前"取消"）。** 原先的论证——"槽里放着的块不会再被写"——成立，但它让**最新的 KV 永远读不到槽**：窗开到吃满设备段时，每步都要把刚写的那个块经链路读一遍，每层一次。这正是首版实测更慢的结构性来源之一。
+   落地形式不是把 q8_0/q4_0 的量化转换在写 kernel 里实现第二遍——那必须与 ggml `set_rows` 逐位一致，而"开/关同字节"这条验收线就押在上面；而且默认写路径是 vendored ggml 的 `set_rows`（`state.rs:1057-1061` 有 TurboQuant 取代它的先例）。做法是**整块字节刷新**：本步写集里的块若已驻留，就由同一个 copy kernel 把它的整块从权威位置拷进槽，排在 miss 之前、永不被 claim 挤掉（装不下时改为作废该块的映射，读退回 identity——把槽指过去就会读到本步自己的旧字节）。逐位一致由"这是内存拷贝"天然保证。写集块因此可以正常驻留并被本地读，其槽在本步对 victim 免疫。
 2. **姿态 B 的边界**：slot 池 = 池虚拟范围的前 W 个块 id（现状天然在 VRAM）。分配隔离：
    池建好后把块 0..W 永久占住（ref_counts 置 1，永不释放），admission 只会拿到 ≥ W 的
    id → 全部 host 身份位。驻留图 `residency[block]=slot`、`slot_block[slot]`、
@@ -164,6 +165,8 @@ block table、KV 写的 `cells`、`pos` 都是**每步由 host 重新填充的�
    所以被 promote 的块各层数据都已稳定，整块跨层拷贝无撕裂；这些块下一步起不再是写集，
    那时才进缓存。prompt 步里同一步的读不受影响——读经 host identity（未重指向）或已
    稳定块的正确槽。**不需要尾块 gap**。
+
+   **（2026-11-28 修正）归纳不再是不变量的唯一保证。** 上面那条论证对 append 与 MTP 回退确实成立——被拒草稿写的位置必定落在**上一步的写集**内（`src/spec/mod.rs:35-40`：被拒位置的 K/V 留着由下一步覆盖写，`BlockTable::truncate` 只归还越过新末尾的**整块**），而那些块在上一步已被保护、更早的步又不可能选中"未来"的块。但它覆盖不到"写位置大幅回退"的路径：radix 截断、warm/会话恢复到更早长度（`lm.rs:7422/7437/7463`、`7895`）之后从块中间继续写，而跨截断边界那个块不会被释放（`blocks.rs:412-423`），于是"已驻留 → 被重写 → 槽陈旧"。§4.10.1 的写穿把这条路彻底闭掉：不变量从此是**构造保证**（驻留 ⇒ 自上次拷贝起 host 没被写过），不再依赖对全引擎 truncate/重算/replay 路径的穷举论证，§6.3 那条开放问题一并闭掉。
 4. **promote 是全块跨层**：一个块 id 在每层 (K,V) 池里索引同位。copy kernel 按层基指针
    设备数组循环（K、V 各一张），一次 miss 拷 `n_qsa_layers × 块字节`——与"槽=块的完整
    副本"语义一致，避免逐层驻留的不一致状态。
@@ -176,15 +179,22 @@ block table、KV 写的 `cells`、`pos` 都是**每步由 host 重新填充的�
 7. **表上传即真值**：任何时刻"表项 → 实际读到的字节"要么 host identity、要么内容与 host
    相等的槽——正确性不依赖读方是谁、哪层。
 
-8. **测试**：移植 parity 测试形态（合成选择形状：整块 + 阈值残块 + 尾块 + 半近期，双跑逐位相等 + 驻留图一致 + 计数自洽，Strata `kv_stream_parity.cpp`）；Legion 侧加现有 `--deterministic` 同文本对拍（开/关逐字节一致是本仓库的既有验收线，如 `--expert-peer-fetch` 行，`docs/serving.md:178`）。
+8. **测试**：移植 parity 测试形态（合成选择形状：整块 + 阈值残块 + 尾块 + 半近期，双跑逐位相等 + 驻留图一致 + 计数自洽，Strata `kv_stream_parity.cpp`）；Legion 侧加现有 `--deterministic` 同文本对拍（开/关逐字节一致是本仓库的既有验收线，如 `--expert-peer-fetch` 行，`docs/serving.md:178`）。**尚未落地**：目前只有 `slot_cache.rs` 的模型级单测（含写穿的三个用例）与 `blocks/tests.rs` 的 reserve 测试；跨序列共享 host 块、prompt 大步长两类形状没覆盖，GPU parity 测试与 §5.4 的 A/B 都还欠着。
+
+9. **首版实测变慢的两个实现根因（2026-11-28 修复，与命中率无关、每步每层照付）**：
+   - **clock hand 必须在设备端。** `Slots` 按值传进 `resolve_kernel`，`s.hand = ...` 写的是 kernel 参数副本 → hand 永不离开 0：每层每步都从窗首重扫、边扫边清引用位，低编号槽被反复逐出，停在前面几个槽上的热块每步被踢。现在 `meta[0]`=hand、`meta[1]`=epoch，都是设备内存。
+   - **不要每层"清零 + 扫全表"。** 选 victim 原本是单线程 `referenced[w] = 0` 再串行读整张 block table，每层一次（长上下文下 8×上千项）。Strata 的 `slot_stamp`/epoch 正是为此存在：walk 经过时盖 epoch、写穿时盖 epoch，victim 只比 `ref_epoch[v] == epoch`，既不清零也不扫表。模型侧同步去掉扫表（`referenced` 由 walk 与写穿填充），两边仍互为镜像。
+   - 顺带：rebuild（每次 `resize_kv` 都会 register）原先只 `cudaFree` 了 `residency`，其余全漏；现在统一走 `free_state`。
+   - **仍未做**：copy 列表的容量仍是保守值 `min(n_blocks,8192).max(w)`，warm 步也要 launch `copy_chunks × copy_max` 个早退 CTA；真正的界应是 `rows × (top_k/64 + 1)`（Strata 的对应式是 `n_q × (cap/page_size + 2)`，见 §1.4）。等真机 profile 确认这一项的占比后再定标，避免拍一个过小上界反而把 claim 打成 overflow。
+
 
 ## 5. 分期与决策点
 
 - **Phase 0 — 测量，先于一切实现**：插桩已实现（`LEGION_DEBUG_KV_STATS=1`，
   src/model/qwen4/kv_stats.rs + src/cuda/kv_stats.cu，挂在 attention 的 `after_attn`，
   与 `sel_dump` 同形；不建图节点，位级不动）。runbook 见 §5.1，Go/No-Go 判定见 §5.2。
-- **Phase 1 — 最小闭环**：G1-G4 + parity；qwen4exp + q8_0/q4_0；机制随 host tier 自动
-  生效，唯一开关 `--no-kv-slot-cache`（§4.7）；单 stage、无 TP。验收 = parity +
+- **Phase 1 — 最小闭环**：G1-G4 + parity；qwen4exp + q8_0/q4_0；显式开关 `--kv-slot-cache <tokens>`
+  （§4.7，默认关）；单 stage、无 TP。验收 = parity +
   4090/AC922 实测表。
 - **Phase 2 — 策略与整合**：auto 规则进 memory plan；metrics/report；多序列共享 slot 去重；
   与 `--kv-vmm-keep`、`--kv-admission on-demand` 的组合语义。
@@ -235,24 +245,24 @@ kv stats: decode steps read <host> of <total> selected cells from host blocks
 - 辅助核对：`fetch ≈ 稳态增速 × unique`；`unique/rows` 持续增长 = 选择无复用。
 - 顺带验收位级不动：同请求开/关 `LEGION_DEBUG_KV_STATS` 贪心输出逐字节一致。
 
-### 5.4 Phase 1 的 A/B（slot cache 本体；默认自动开，`--no-kv-slot-cache` 关）
+### 5.4 Phase 1 的 A/B（slot cache 本体；默认关，`--kv-slot-cache <tokens>` 开）
 
-实现落地（分支 `feat/kv-slot-cache`）：窗口=块池前 W 个 id（`BlockPool::reserve`，永不参与
-分配）；host tier 持全部其余块；resolve/copy 两内核挂在 QSA select 与 attention 之间
-（src/cuda/kv_slots.cu，镜像已测模型 src/model/qwen4/slot_cache.rs）；释放失效挂在
-`BlockPool::decref` 观察者。**政策已按 §4.7 落地**：满足（host tier ∧ QSA ∧ q8_0/q4_0）
-即自动开（默认 W=2048 块，按 §5.3 热集定）；`--no-kv-slot-cache` 关；
-`LEGION_DEBUG_KV_SLOTS=<W>` 只覆盖宽度（A/B 调参用）。范围限制：需已有 host tier，不与
-`--kv-slots`/`--kv-vmm-keep`/`--tp` 同开（v1）。
+实现落地（分支 `feat/kv-slot-cache`）：窗口 = 设备段内前 W 个 id（`BlockPool::reserve`，永不
+参与分配；tier 边界与 host 段不动，代价是 KV 容量少 W，见 §4 定稿）；resolve/copy 两内核挂在
+QSA select 与 attention 之间（src/cuda/kv_slots.cu，镜像已测模型
+src/model/qwen4/slot_cache.rs）；释放失效挂在 `BlockPool::decref` 观察者；本步写过的驻留块由
+同一次 copy 刷新（§4.10.1）。**政策**：默认关，`--kv-slot-cache <tokens>` 显式开；条件不满
+（无 host tier / 非 QSA / 缓存类型不对 / 撞 `--kv-slots`·`--kv-vmm-keep`·`--tp` / 容量不够）
+时启动日志逐条说明为什么没开。
 
 ```sh
 # 同一命令、同一会话脚本，跑两遍对照：
-<原 AC922/4090 命令，需出现 kv host tier>                      # 自动开（memory plan 有 kv slot window 行）
-<原命令> --no-kv-slot-cache                                    # 关
-# 需要试别的窗口宽度时：LEGION_DEBUG_KV_SLOTS=1024 …
+<原 AC922/4090 命令，需出现 kv host tier>                       # 关（默认）
+<原命令> --kv-slot-cache 131072                                 # 开；memory plan 有 kv slot window 行
 ```
 
-自动开时启动日志有 memory plan 的 `part="kv slot window"` 行；两侧都缺 = 条件未满足
+开时启动日志有 memory plan 的 `part="kv slot window"` 行（含 `kv_usable_tokens`）；
+两侧都缺 = 条件未满足
 （无 tier 或撞了范围限制）。RAM 吃紧的自动 tier 若报主机预算错误：取更小的 W，或显式
 `--kv-host-tokens` 给定容量。看两件事：
 
@@ -263,7 +273,7 @@ kv stats: decode steps read <host> of <total> selected cells from host blocks
    expert cache 的 hit_rate 在 B 姿态下应同步上升（KV 让出的 VRAM 进了 slots）。
 
 回传：开侧 memory plan 的 `part="kv slot window"` 行（关侧应无）、两侧 decode tok/s、
-若干条两侧稳态 `kv stats:`、以及同字节核对结果。据此定：保留 auto-on（收益确认）→
+若干条两侧稳态 `kv stats:`、以及同字节核对结果。据此定：保留默认开（收益确认）→
 补 `serving.md` 行、按需调默认 W；或调 W / 默认改关（数据说话）。
 
 ### 5.3 实测结果与判定（2026-11-27）
@@ -284,7 +294,7 @@ KV 出现 host tier）。上下文增长后序列越过 VRAM 段、进入 host �
 阈值）、复用 1000×（每块重复拉取千次——slot 缓存的收益来源）；expert cache 日志
 （hit_rate 0.645→0.887、swaps 持续增长）说明 VRAM 已被 expert cache 吃紧 → 把 KV 的
 VRAM 窗收缩到 slot 工作集（实测热集 ~1.3K 块，取 ~2K 块窗），腾出的 VRAM 给 expert
-slots，链路折减与腾显存一起拿。Phase 1 在同机跑 `--no-kv-slot-cache` 的开/关 A/B 确认
+slots，链路折减与腾显存一起拿。Phase 1 在同机跑 `--kv-slot-cache` 的开/关 A/B 确认
 decode tok/s 与同文本贪心一致。
 
 测量工具本身被这轮暴露并已修复一处口径缺陷：直方图原为 decode/prompt 共用一份，decode
