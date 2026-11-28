@@ -42,6 +42,12 @@ struct ReleaseRing {
     volatile unsigned long long ctl_mirror[6]; // = N_CTL, mirrored by the resolve kernel
     volatile unsigned long long drops;         // host-side: a full ring forced a flush
     volatile int flush_all;                    // set by the producer, drained by the resolve
+    // The first broken invariant, with the ids, for the reporter to print once. 1: an entry
+    // in a selection names a slot nobody claimed (a foreign state rewrote this table). 2: an
+    // entry resolves outside the pool. 3: a resident mapping points past the window. 4: a
+    // victim took a slot the walk had already read this call.
+    volatile int bad_kind;
+    volatile long long bad[4];
     static const int R = 1 << 16;
     volatile int ids[R];
 };
@@ -53,6 +59,7 @@ constexpr int N_CTL = 6;
 struct Slots {
     int dev = -1;
     long long w = 0, n_blocks = 0;
+    long long hbm = 0;        // blocks resident in the device range: paging one buys nothing
     int32_t* residency = nullptr;   // block -> slot, -1: not resident
     uint32_t* slot_block = nullptr; // slot -> block + 1, 0: never claimed (kept past eviction)
     uint8_t* slot_ref = nullptr;    // the clock's second-chance bit
@@ -78,6 +85,15 @@ struct Slots {
     // "always scan from the front".
     ReleaseRing* ring = nullptr; // pinned, host-visible
 };
+
+/// Record the first broken invariant, with the numbers behind it.
+__device__ __forceinline__ void bad(Slots& s, int kind, long long a, long long b) {
+    if (s.ring->bad_kind == 0) {
+        s.ring->bad[0] = a;
+        s.ring->bad[1] = b;
+        s.ring->bad_kind = kind;
+    }
+}
 
 /// Drop a pool's device state. `register` runs again on every `resize_kv` (the ids moved),
 /// so a rebuild is not a rare path: everything the build allocated goes here.
@@ -190,9 +206,20 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
         if (slot > 0 && r[slot] / 64 == p / 64) continue;
         int seq = min(row / nt, n_seqs - 1);
         long long cell = (long long)seq * tab_nb1 + p / 64;
-        long long b = entry_block(tab[cell], s.w, s.slot_block);
-        if (b < 0 || b >= s.n_blocks) continue;
+        int entry = tab[cell];
+        long long b = entry_block(entry, s.w, s.slot_block);
+        if (b < 0) {
+            // An entry in a live selection naming a slot nobody ever claimed: this table is
+            // not the one this state was built over, and reading through it is wrong.
+            if (entry >= 0 && entry < s.w) bad(s, 1, entry, cell);
+            continue;
+        }
+        if (b >= s.n_blocks) {
+            bad(s, 2, b, cell);
+            continue;
+        }
         int32_t v = s.residency[b];
+        if (v >= s.w) bad(s, 3, b, v);
         if (s.protected_mark[b]) {
             if (v < 0) {
                 atomicAdd(&s.ctl[C_PROTECTED], 1ULL);
@@ -211,6 +238,10 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
             atomicAdd(&s.ctl[C_HITS], 1ULL);
             continue;
         }
+        // A block below the tier boundary is device memory already: claiming it spends a
+        // window slot and a full copy on bytes that never crossed the link, and evicts a
+        // host block that would have.
+        if (b < s.hbm) continue;
         if (atomicExch(&s.claimed_mark[b], 1) == 0) {
             int at = atomicAdd(s.copy_count, 1);
             if (at < s.copy_max)
@@ -244,7 +275,10 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
                     s.slot_ref[v] = 0;
                     continue;
                 }
-                if (s.ref_epoch[v] == epoch) continue;
+                if (s.ref_epoch[v] == epoch) {
+                    bad(s, 4, v, hand);  // unreachable while the stamping covers the table
+                    continue;
+                }
                 unsigned long long old = s.slot_block[v];
                 if (old != 0 && s.residency[old - 1] == (int32_t)v) {
                     s.residency[old - 1] = -1;
@@ -321,12 +355,13 @@ extern "C" {
 /// Builds device `dev`'s slot state over a pool of `n_blocks` with a `w`-block window, the
 /// copy segments (`segs`, `n_segs`: every tiered attention layer's K and V) and the
 /// claim-list cap. A CUDA error code, 0 for good.
-int legion_kv_slots_ensure(int dev, long long w, long long n_blocks, long long cell_space,
-                           const Seg* segs, int n_segs, int copy_max) {
+int legion_kv_slots_ensure(int dev, long long w, long long n_blocks, long long hbm,
+                           long long cell_space, const Seg* segs, int n_segs, int copy_max) {
     Slots s;
     s.dev = dev;
     s.w = w;
     s.n_blocks = n_blocks;
+    s.hbm = hbm;
     s.n_segs = n_segs;
     s.copy_max = copy_max;
     long long max_bytes = 1;
@@ -417,6 +452,9 @@ int legion_kv_slots_read(int dev, unsigned long long* ctl) {
     const volatile unsigned long long* m = it->second.ring->ctl_mirror;
     for (int i = 0; i < N_CTL; i++) ctl[i] = m[i];
     ctl[C_DROPS] = it->second.ring->drops;  // counted host-side, so read it from the ring
+    const volatile ReleaseRing* r = it->second.ring;
+    ctl[6] = (unsigned long long)r->bad_kind;  // the first broken invariant, if any
+    for (int i = 0; i < 4; i++) ctl[7 + i] = (unsigned long long)r->bad[i];
     return 0;
 }
 

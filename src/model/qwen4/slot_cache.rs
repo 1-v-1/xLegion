@@ -596,6 +596,28 @@ pub(crate) struct SlotCounters {
     pub evictions: u64,
     pub overflow: u64,
     pub drops: u64,
+    /// The first invariant the kernel broke: `(kind, a, b)`, kind 0 for none. A non-zero
+    /// kind is a wrong-read candidate, not a tuning signal - see the kinds in kv_slots.cu.
+    pub bad: (u64, u64, u64),
+}
+
+/// A broken invariant is an error line, once per process: it means a read went somewhere
+/// wrong, which no amount of hit-rate tuning explains away.
+#[cfg(feature = "cuda")]
+pub(crate) fn report_bad(bad: (u64, u64, u64)) {
+    if bad.0 == 0 {
+        return;
+    }
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    tracing::error!(
+        kind = bad.0,
+        a = bad.1,
+        b = bad.2,
+        "kv slots: a window invariant broke (1 entry names an unclaimed slot, 2 id outside the pool, 3 mapping past the window, 4 victim took a live slot)"
+    );
 }
 
 /// The window of the registered state, 0: off (the stats snapshot's question).
@@ -613,16 +635,20 @@ pub(crate) fn read_counters() -> SlotCounters {
     if !ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
         return SlotCounters::default();
     }
-    let mut out = [0u64; 6];
+    let mut out = [0u64; 11];
     let mut sum = [0u64; 6];
+    let mut bad = (0u64, 0u64, 0u64);
     let mut devs: Vec<usize> = pools().lock().unwrap().iter().map(|&(_, d)| d).collect();
     devs.sort_unstable();
     devs.dedup();
     for &dev in devs.iter() {
         // SAFETY: plain C, `out` is 6 u64s.
         if unsafe { legion_kv_slots_read(dev as i32, out.as_mut_ptr()) } == 0 {
-            for (a, b) in sum.iter_mut().zip(out) {
-                *a += b;
+            for (a, b) in sum.iter_mut().zip(out.iter()) {
+                *a += *b;
+            }
+            if out[6] != 0 && bad.0 == 0 {
+                bad = (out[6], out[7], out[8]);
             }
         }
     }
@@ -633,6 +659,7 @@ pub(crate) fn read_counters() -> SlotCounters {
         evictions: sum[3],
         overflow: sum[4],
         drops: sum[5],
+        bad,
     }
 }
 
@@ -687,13 +714,21 @@ fn unknown(base: u64) {
 /// the reserved window, over `segments` (every tiered attention layer's K and V). Called
 /// where the pool's tier is built; a rebuild replaces the state (the ids moved).
 #[cfg(feature = "cuda")]
-pub(crate) fn register(device: usize, w: usize, n_blocks: usize, cell_space: usize, segments: &[Seg]) {
+pub(crate) fn register(
+    device: usize,
+    w: usize,
+    n_blocks: usize,
+    hbm: usize,
+    cell_space: usize,
+    segments: &[Seg],
+) {
     // SAFETY: plain C; `segments` outlives the call.
     let code = unsafe {
         legion_kv_slots_ensure(
             device as i32,
             w as i64,
             n_blocks as i64,
+            hbm as i64,
             cell_space as i64,
             segments.as_ptr(),
             segments.len() as i32,
@@ -738,6 +773,9 @@ pub(crate) fn active() -> bool {
 pub(crate) fn read_counters() -> SlotCounters {
     SlotCounters::default()
 }
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn report_bad(_: (u64, u64, u64)) {}
 
 /// The engine's release hook: a block the allocator freed loses its slot (§4.10.6). With
 /// the mechanism off this is one relaxed load on the allocator's path.
@@ -835,11 +873,13 @@ unsafe fn cuda_slots(
 
 #[cfg(feature = "cuda")]
 unsafe extern "C" {
-    /// Builds the device's slot state; see [`register`].
+    /// Builds the device's slot state; see [`register`]. `hbm` is the pool's tier boundary:
+    /// blocks below it are device memory already and are never paged.
     fn legion_kv_slots_ensure(
         dev: i32,
         w: i64,
         n_blocks: i64,
+        hbm: i64,
         cell_space: i64,
         segs: *const Seg,
         n_segs: i32,
@@ -862,8 +902,8 @@ unsafe extern "C" {
     );
     /// A freed block's slot dies.
     fn legion_kv_slots_release(id: i32);
-    /// The kernel-mirrored counters (6 u64): hits, misses, protected, evictions, overflow,
-    /// drops (the last counted host-side in the ring). Reads pinned memory, no CUDA call.
-    /// 3: no state.
+    /// The kernel-mirrored counters (11 u64): hits, misses, protected, evictions, overflow,
+    /// drops (the last counted host-side in the ring), then the first broken invariant
+    /// `(kind, a, b)` and padding. Reads pinned memory, no CUDA call. 3: no state.
     fn legion_kv_slots_read(dev: i32, ctl: *mut u64) -> i32;
 }

@@ -7278,6 +7278,7 @@ impl Worker {
                     s.kv_slot_protected = c.protected;
                     s.kv_slot_overflow = c.overflow;
                     s.kv_slot_drops = c.drops;
+                    crate::model::qwen4::slot_cache::report_bad(c.bad);
                 }
                 if let Some(experts) = expert_stats {
                     s.expert_cache_hits = experts.hits;

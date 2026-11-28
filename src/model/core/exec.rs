@@ -1305,6 +1305,7 @@ impl Executor {
                     t.device,
                     self.kv_slots,
                     n_blocks,
+                    t.hbm_blocks,
                     cell_space,
                     &segs,
                 );
