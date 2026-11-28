@@ -849,13 +849,19 @@ pub(in crate::cli) struct SwitchArgs {
     /// comparisons.
     #[arg(long, help_heading = HEADING)]
     no_expert_peer_fetch: bool,
-    /// Turns the automatic KV slot cache off (docs/kv-streaming-porting-notes.md): without
-    /// it, a sparse model over a KV host tier keeps a window of the cache in VRAM as a
-    /// demand-paged copy of the blocks its selections read, instead of reading those over
-    /// the link every step. The same output bits either way (a slot is a copy the step
-    /// keeps current); for comparisons and `--deterministic` runs.
-    #[arg(long, help_heading = HEADING)]
-    no_kv_slot_cache: bool,
+    /// The KV slot cache's window in tokens (docs/kv-streaming-porting-notes.md): over a KV
+    /// host tier the first of the pool's device blocks become a window no sequence is ever
+    /// allocated, and the blocks a sparse-attention step selects are pulled into it on demand
+    /// (a second-chance clock picks the victims) instead of being read over the link on every
+    /// step. The window comes out of what `--kv-cache-tokens` opened - that flag and
+    /// `--kv-host-tokens` keep their meaning - so what it costs is KV capacity: sequences
+    /// share the rest of the pool. A wide window caches more selections and leaves less cache;
+    /// it may take the whole device range, in which case every KV write crosses the link. 0
+    /// (the default): off. The same output bits either way. Needs a host tier, the cache
+    /// types the sparse kernels read in place (q8_0/q4_0), and not `--kv-slots`,
+    /// `--kv-vmm-keep` or `--tp` (Phase 1 scope).
+    #[arg(long, value_name = "TOKENS", help_heading = HEADING)]
+    kv_slot_cache: usize,
     /// --expert-peer-fetch without --expert-miss-overlap: the idle peer stages TAKE of every
     /// EVERY of a layer's missed experts (in the order of their first use, at most TAKE/EVERY of
     /// 16 a layer), the running GPU reads the rest in place over its own host link. Default 1/2
@@ -1729,7 +1735,7 @@ impl SwitchArgs {
             } else {
                 self.no_expert_peer_fetch.then_some(false)
             },
-            kv_slot_cache: self.no_kv_slot_cache.then_some(false),
+            kv_slot_cache_tokens: self.kv_slot_cache,
             expert_peer_share: self.expert_peer_share,
             expert_peer_ctas: self.expert_peer_ctas.map(usize::from),
             qsa_scores_tc: self.qsa_scores_tc.then_some(true),

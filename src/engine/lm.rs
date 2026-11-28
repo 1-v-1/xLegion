@@ -5433,21 +5433,28 @@ impl LmEngine {
                     host_blocks = host_blocks.min((tier_most_tokens / KV_BLOCK).max(sized));
                 }
             }
-            // The KV slot cache (docs/kv-streaming-porting-notes.md §4.7): automatic on
-            // exactly where it measured to pay (§5.3) - a model whose sparse kernels read
-            // the caches in place, over a host tier, with the caches in those types.
-            // `--no-kv-slot-cache` turns it off; `LEGION_DEBUG_KV_SLOTS` sizes the window
-            // for the A/B (§5.4), else the default sized to the measured hot set. Scope:
-            // no sequence slots, no lent tail, no tensor parallelism (Phase 1).
-            let auto = !cfg.switches.kv_slot_cache.is_some_and(|on| !on)
-                && crate::model::qwen4::qsa_attn::reads_types(cfg.cache_types)
-                && (0..hp.n_layer).any(|il| hp.arch.indexed(il));
-            if auto {
-                let w = crate::model::qwen4::slot_cache::window_blocks()
-                    .unwrap_or(crate::model::qwen4::slot_cache::DEFAULT_WINDOW_BLOCKS);
+            // The KV slot cache (docs/kv-streaming-porting-notes.md §4.7): `--kv-slot-cache
+            // <tokens>`, off at 0. The window is carved out of the VRAM `--kv-cache-tokens`
+            // already opened - neither capacity flag changes meaning, no VRAM and no RAM is
+            // asked for, and what the window costs is KV capacity: sequences share
+            // `n_blocks - w` blocks instead of `n_blocks`. Scope: no sequence slots, no lent
+            // tail, no tensor parallelism (Phase 1).
+            let want = cfg.switches.kv_slot_cache_tokens;
+            if want > 0 {
+                let w = want.div_ceil(KV_BLOCK);
                 let conflicts =
                     exec.kv_slot_blocks() > 0 || cfg.switches.kv_vmm_keep.is_some() || cfg.tp > 1;
-                if host_tokens == 0 {
+                let usable = hbm_blocks + host_blocks;
+                // One context, whatever else the pool has to hold: sequences can only be
+                // admitted inside what the window leaves over.
+                let room = usable.saturating_sub(cfg.ctx_size.div_ceil(KV_BLOCK));
+                if !crate::model::qwen4::qsa_attn::reads_types(cfg.cache_types) {
+                    tracing::info!(
+                        "kv slot cache: off (the sparse kernels do not read these cache types in place)"
+                    );
+                } else if !(0..hp.n_layer).any(|il| hp.arch.indexed(il)) {
+                    tracing::info!("kv slot cache: off (no indexed sparse layers)");
+                } else if host_tokens == 0 {
                     tracing::info!("kv slot cache: off (no host tier: every block is already in device memory)");
                 } else if conflicts {
                     tracing::info!(
@@ -5456,31 +5463,23 @@ impl LmEngine {
                         tp = cfg.tp > 1,
                         "kv slot cache: off (out of Phase 1 scope: --kv-slots / --kv-vmm-keep / --tp)"
                     );
-                } else if w + 64 >= hbm_blocks + host_blocks {
+                } else if w > hbm_blocks {
+                    // The slots have to be device memory: a wider window than the device
+                    // range would cache host blocks in host memory.
+                    tracing::info!(
+                        window_blocks = w,
+                        device_blocks = hbm_blocks,
+                        "kv slot cache: off (--kv-slot-cache asks for more than the device range)"
+                    );
+                } else if w >= room {
                     tracing::info!(
                         window_blocks = w,
                         device_blocks = hbm_blocks,
                         host_blocks,
-                        "kv slot cache: off (the pool cannot spare a window and one context)"
+                        "kv slot cache: off (the window would leave no room for one context)"
                     );
                 } else {
-                    // A window at or above the old device range is legal: same VRAM, smarter
-                    // placement. The one real bound is the host side - sequences only ever
-                    // hold host-backed ids, so what a window leaves over must still hold a
-                    // context; clamp there and say so. Position B never resizes the pool:
-                    // the host takes exactly the blocks the window gives up (§4.10).
-                    let max_w = (hbm_blocks + host_blocks).saturating_sub(cfg.ctx_size.div_ceil(KV_BLOCK));
-                    let w_eff = w.min(max_w.max(8));
-                    if w_eff != w {
-                        tracing::info!(
-                            asked_blocks = w,
-                            window_blocks = w_eff,
-                            "kv slot cache: the window was clamped to keep one context of host blocks"
-                        );
-                    }
-                    kv_slots = w_eff;
-                    host_blocks = hbm_blocks + host_blocks - w_eff;
-                    hbm_blocks = w_eff;
+                    kv_slots = w;
                 }
             }
             // Sequence slots: each slot's first blocks in VRAM.
@@ -5512,15 +5511,16 @@ impl LmEngine {
             let nodes: Vec<u32> = tiers.iter().flatten().map(|t| t.node).collect();
             exec.set_kv_tiers(tiers);
             if kv_slots > 0 {
-                // The slot window replaces the VRAM range above (§4.10): register it with
-                // the executor (the pools' states are built on the resize below) and say
-                // what the host now holds: every block past the window.
+                // The window sits inside the device range `--kv-cache-tokens` opened; the
+                // tier boundary and the host range are untouched, so the only thing it takes
+                // is capacity: sequences share the rest of the pool (§4.10.2).
                 exec.set_kv_slots(kv_slots, max_seqs);
                 tracing::info!(
                     window_blocks = kv_slots,
                     window_tokens = kv_slots * KV_BLOCK,
-                    host_blocks = n_blocks - kv_slots,
-                    "kv slot cache: window over the host tier (LEGION_DEBUG_KV_SLOTS)"
+                    kv_usable_tokens = (n_blocks - kv_slots) * KV_BLOCK,
+                    kv_pool_tokens = n_blocks * KV_BLOCK,
+                    "kv slot cache: window inside the device range"
                 );
             }
             if auto_tier && host_blocks > 0 {
