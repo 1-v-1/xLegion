@@ -380,19 +380,25 @@ int legion_kv_slots_ensure(int dev, long long w, long long n_blocks, long long h
          cudaMemset(s.protected_mark, 0, n_blocks * 4) == cudaSuccess &&
          cudaMemset(s.claimed_mark, 0, n_blocks * 4) == cudaSuccess &&
          cudaMemset(s.span_count, 0, 4) == cudaSuccess &&
+         cudaMemset(s.verify_count, 0, 4) == cudaSuccess &&
          cudaMemset(s.ref_epoch, 0, w * 4) == cudaSuccess &&
          cudaMemset(s.meta, 0, 8) == cudaSuccess;
     if (ok) {
         s.ring->produce = 0;
         s.ring->consumed = 0;
         cudaMemcpy(s.segs, segs, n_segs * sizeof(Seg), cudaMemcpyHostToDevice);
+        std::lock_guard<std::mutex> lock(g_mu);
         Slots& into = g_slots[dev];
-        if (into.residency) {
-            for (int i = 0; i < into.n_segs; i++) g_by_base.erase((uintptr_t)into.segs[i].base);
-            free_state(into);  // a rebuild: the ids moved
-        }
+        // Drop the previous pool's entries by owner, not by re-reading its segments: `segs`
+        // in the state is the device copy, and indexing it here would fault on the host.
+        for (auto b = g_by_base.begin(); b != g_by_base.end();)
+            b = (b->second == &into) ? g_by_base.erase(b) : std::next(b);
+        if (into.residency) free_state(into);  // a rebuild: the ids moved
         into = s;
-        for (int i = 0; i < into.n_segs; i++) g_by_base[(uintptr_t)into.segs[i].base] = &into;
+        // Index from the caller's host array - the only copy of the bases readable here.
+        for (int i = 0; i < n_segs; i++) g_by_base[(uintptr_t)segs[i].base] = &into;
+    } else {
+        free_state(s);  // a partial build: nothing is registered, so nothing holds these
     }
     cudaSetDevice(prev);
     return ok ? 0 : 1;
