@@ -620,6 +620,19 @@ pub(crate) fn report_bad(bad: (u64, u64, u64)) {
     );
 }
 
+/// `LEGION_KV_SLOT_SHADOW=1`: claim, copy and count as usual but serve every read from the
+/// authority. One run then says whether wrong output comes from reading a slot at all.
+pub(crate) fn shadow() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("LEGION_KV_SLOT_SHADOW").is_ok_and(|v| v != "0");
+        if on {
+            tracing::warn!("kv slots: SHADOW mode - the window is kept and filled, nothing reads from it");
+        }
+        on
+    })
+}
+
 /// The window of the registered state, 0: off (the stats snapshot's question).
 pub(crate) fn window() -> usize {
     WINDOW.load(std::sync::atomic::Ordering::Relaxed)
@@ -864,6 +877,7 @@ unsafe fn cuda_slots(
             rows as i32,
             (rows / n_seqs).max(1) as i32,
             n_seqs as i32,
+            shadow() as i32,
             p[0] - 1,
             stream,
         );
@@ -897,6 +911,7 @@ unsafe extern "C" {
         rows: i32,
         n_tok: i32,
         seqs: i32,
+        shadow: i32,
         dev: i32,
         stream: *mut std::os::raw::c_void,
     );

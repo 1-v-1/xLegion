@@ -113,6 +113,14 @@ std::map<int, Slots> g_slots;
 constexpr int RT = 1024;
 constexpr long long COPY_STRIDE = 64 * 1024;
 
+/// Shadow mode (host-set, baked into the launch): claim, copy and count exactly as usual,
+/// but never re-point a table entry, so every read still goes to the authority. It exists to
+/// answer one question in one run: is the wrong output caused by serving from a slot, or by
+/// something the state machine does besides that?
+__global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int32_t* __restrict__ tab,
+                               long long tab_nb1, const int* __restrict__ pos, int rows, int n_tok,
+                               int seqs, int shadow, Slots s);
+
 /// The model's `entry_block`: at-or-above `w` the entry is its own block; below, the slot's
 /// `slot_block` names whose bytes it holds. A never-claimed slot (`0`) maps to nothing.
 __device__ __forceinline__ long long entry_block(int entry, long long w, const uint32_t* slot_block) {
@@ -124,7 +132,7 @@ __device__ __forceinline__ long long entry_block(int entry, long long w, const u
 
 __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int32_t* __restrict__ tab,
                                long long tab_nb1, const int* __restrict__ pos, int rows, int n_tok,
-                               int seqs, Slots s) {
+                               int seqs, int shadow, Slots s) {
     const int tid = threadIdx.x;
     const int nt = max(n_tok, 1);
     const int n_seqs = max(seqs, 1);
@@ -163,7 +171,9 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
     // the entry naming bytes that belong to somebody else, with no way back.
     for (long long c = tid; c < (long long)n_seqs * tab_nb1; c += RT) {
         int e = tab[c];
-        if (e >= 0 && e < s.w) s.ref_epoch[e] = epoch;
+        // `e == 0` is a padded row, not slot 0: with a window open, id 0 is reserved and no
+        // sequence can hold it. Treating the padding as slot 0 pinned that slot forever.
+        if (e > 0 && e < s.w) s.ref_epoch[e] = epoch;
     }
 
     // 1. Protect the blocks this step's tokens write (§4.10.3): never a claim. The span's
@@ -220,6 +230,7 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
         }
         int32_t v = s.residency[b];
         if (v >= s.w) bad(s, 3, b, v);
+        if (shadow) continue;  // state and counts as usual; the reads stay on the authority
         if (s.protected_mark[b]) {
             if (v < 0) {
                 atomicAdd(&s.ctl[C_PROTECTED], 1ULL);
@@ -275,10 +286,8 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
                     s.slot_ref[v] = 0;
                     continue;
                 }
-                if (s.ref_epoch[v] == epoch) {
-                    bad(s, 4, v, hand);  // unreachable while the stamping covers the table
-                    continue;
-                }
+                // Held back on purpose: the walk, the refresh or the live table reads it.
+                if (s.ref_epoch[v] == epoch) continue;
                 unsigned long long old = s.slot_block[v];
                 if (old != 0 && s.residency[old - 1] == (int32_t)v) {
                     s.residency[old - 1] = -1;
@@ -310,6 +319,7 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
     for (long long c = tid; c < (long long)n_seqs * tab_nb1; c += RT) {
         if (!s.requested[c]) continue;
         s.requested[c] = 0;  // cleared on every path, so no bit survives a skipped entry
+        if (shadow) continue;
         long long b = entry_block(tab[c], s.w, s.slot_block);
         if (b < 0) continue;
         int32_t v = s.residency[b];
@@ -434,12 +444,13 @@ void legion_kv_slots_release(int id) {
 /// The captured-graph hook: resolve, then the copy, on `stream`. Called from the
 /// `qsa_kv_slots` op with the attention node's own operands.
 void legion_kv_slots_graph(const int* sel, long long sel_nb1, int* tab, long long tab_nb1,
-                           const int* pos, int rows, int n_tok, int seqs, int dev, void* stream) {
+                           const int* pos, int rows, int n_tok, int seqs, int shadow, int dev,
+                           void* stream) {
     const auto it = g_slots.find(dev);
     if (it == g_slots.end()) return;
     Slots& s = it->second;
     resolve_kernel<<<1, RT, 0, (cudaStream_t)stream>>>(
-        (int32_t*)sel, sel_nb1, tab, tab_nb1, pos, rows, n_tok, seqs, s);
+        (int32_t*)sel, sel_nb1, tab, tab_nb1, pos, rows, n_tok, seqs, shadow, s);
     dim3 grid(s.copy_chunks, s.copy_max);
     copy_kernel<<<grid, 128, 0, (cudaStream_t)stream>>>(s);
 }
