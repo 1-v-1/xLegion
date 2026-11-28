@@ -83,7 +83,7 @@ struct Slots {
     int32_t* claimed_mark = nullptr;   // (n_blocks) claim dedup (int: atomicExch)
     int32_t* span_list = nullptr;      // (copy_max) this call's write-span blocks
     int32_t* span_count = nullptr;
-    int2* verify_list = nullptr;       // (copy_max) sampled hits, checked against the authority
+    int3* verify_list = nullptr;       // (copy_max) sampled hits: (block, slot, segment)
     int32_t* verify_count = nullptr;
     int32_t* ref_epoch = nullptr;      // (w) the resolve epoch that last read each slot
     int32_t* meta = nullptr;           // [0] the clock hand, [1] the epoch: device-persistent
@@ -247,7 +247,13 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
             unsigned h = ((unsigned)b * 2654435761u) ^ ((unsigned)epoch * 40503u);
             if ((h & 1023u) == 0u) {
                 int at = atomicAdd(s.verify_count, 1);
-                if (at < s.copy_max) s.verify_list[at] = make_int2((int)b, (int)v);
+                // One segment per check, rotated by the same hash. A block has rows in every
+                // layer's K and V; comparing all of them would put a megabyte-scale compare
+                // on a single CTA - the very cost this feature exists to avoid paying. The
+                // rotation covers every segment across steps instead.
+                if (at < s.copy_max)
+                    s.verify_list[at] = make_int3((int)b, (int)v,
+                                                  (int)((h >> 10) % (unsigned)s.n_segs));
             }
             continue;
         }
@@ -333,9 +339,11 @@ __global__ void resolve_kernel(int32_t* __restrict__ sel, long long sel_nb1, int
         for (int i = 0; i < N_CTL; i++) s.ring->ctl_mirror[i] = s.ctl[i];
 }
 
-/// Bytes compared at each end of a sampled block. A slot that went stale because a write
-/// never reached it differs at its tail; a slot answering for the wrong block differs
-/// everywhere. Checking both ends covers the practical cases for a fraction of one copy.
+/// Bytes compared at each end of one sampled (block, slot) pair, within one segment. A slot
+/// that went stale because a write never reached it differs at its tail - the cells a step
+/// writes are the newest ones, and at most a step's worth of them land in one block - while a
+/// slot answering for the wrong block differs everywhere. Both ends therefore cover the
+/// practical cases; a block smaller than the two ends is compared whole (§seg_differs).
 constexpr long long CHECK_ENDS = 16 * 1024;
 
 /// Whether this thread's slice of one segment differs between block `a` and slot `b`.
@@ -388,19 +396,18 @@ __global__ void copy_kernel(Slots s) {
         return;
     }
     // The check a hit asked for: does the slot still hold its block's bytes? One CTA per
-    // pair. If it does not, the mapping is retired on the spot - every later read of that
-    // block falls back to the authority - and the first such pair is reported. So a stale
-    // slot costs one wrong read at most, and the run says whether it happened at all.
+    // pair, on the one segment that hit chose. If it does not, the mapping is retired on the
+    // spot - every later read of that block falls back to the authority - and the first such
+    // pair is reported. So a stale slot costs one wrong read at most, and the run says
+    // whether it happened at all.
     const int vi = c - nc;
     if (vi >= *s.verify_count || blockIdx.x != 0) return;
-    int2 p = s.verify_list[vi];
+    int3 p = s.verify_list[vi];
+    if (p.z < 0 || p.z >= s.n_segs) return;
     __shared__ int sh_diff;
     if (threadIdx.x == 0) sh_diff = 0;
     __syncthreads();
-    bool differ = false;
-    for (int g = 0; g < s.n_segs; g++)
-        if (seg_differs(s.segs[g], p.x, p.y)) differ = true;
-    if (differ) atomicOr(&sh_diff, 1);
+    if (seg_differs(s.segs[p.z], p.x, p.y)) atomicOr(&sh_diff, 1);
     __syncthreads();
     if (sh_diff != 0) {
         s.residency[p.x] = -1;
@@ -450,7 +457,7 @@ int legion_kv_slots_ensure(int dev, long long w, long long n_blocks, long long h
               cudaMalloc((void**)&s.claimed_mark, n_blocks * 4) == cudaSuccess &&
               cudaMalloc((void**)&s.span_list, copy_max * 4) == cudaSuccess &&
               cudaMalloc((void**)&s.span_count, 4) == cudaSuccess &&
-              cudaMalloc((void**)&s.verify_list, copy_max * sizeof(int2)) == cudaSuccess &&
+              cudaMalloc((void**)&s.verify_list, copy_max * sizeof(int3)) == cudaSuccess &&
               cudaMalloc((void**)&s.verify_count, 4) == cudaSuccess &&
               cudaMalloc((void**)&s.ref_epoch, w * 4) == cudaSuccess &&
               cudaMalloc((void**)&s.meta, 8) == cudaSuccess &&
