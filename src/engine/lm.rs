@@ -5463,23 +5463,32 @@ impl LmEngine {
                         tp = cfg.tp > 1,
                         "kv slot cache: off (out of Phase 1 scope: --kv-slots / --kv-vmm-keep / --tp)"
                     );
-                } else if w > hbm_blocks {
-                    // The slots have to be device memory: a wider window than the device
-                    // range would cache host blocks in host memory.
-                    tracing::info!(
-                        window_blocks = w,
-                        device_blocks = hbm_blocks,
-                        "kv slot cache: off (--kv-slot-cache asks for more than the device range)"
-                    );
-                } else if w >= room {
-                    tracing::info!(
-                        window_blocks = w,
-                        device_blocks = hbm_blocks,
-                        host_blocks,
-                        "kv slot cache: off (the window would leave no room for one context)"
-                    );
                 } else {
-                    kv_slots = w;
+                    // The slots have to be device memory, so the window cannot exceed the
+                    // device range - but asking for more is a rounding difference, not a
+                    // reason to do nothing: take what there is and say what that costs.
+                    let w = if w > hbm_blocks {
+                        tracing::info!(
+                            asked_blocks = w,
+                            window_blocks = hbm_blocks,
+                            device_blocks = hbm_blocks,
+                            "kv slot cache: the window takes the whole device range - sequences keep no local block, every KV write crosses the link"
+                        );
+                        hbm_blocks
+                    } else {
+                        w
+                    };
+                    if w >= room {
+                        tracing::info!(
+                            window_blocks = w,
+                            window_max_blocks = room.saturating_sub(1),
+                            device_blocks = hbm_blocks,
+                            host_blocks,
+                            "kv slot cache: off (the window would leave no room for one context)"
+                        );
+                    } else {
+                        kv_slots = w;
+                    }
                 }
             }
             // Sequence slots: each slot's first blocks in VRAM.
